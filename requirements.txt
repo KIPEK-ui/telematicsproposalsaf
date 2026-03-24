@@ -1,0 +1,101 @@
+# Telematics IQ Proposal Generator - Production MVP
+# Python 3.9+ compatible (tested on 3.13.12)
+
+# ========================
+# BUILD TOOLS (REQUIRED FIRST)
+# ========================
+setuptools>=68.0.0                      # Build tool for packages from source
+wheel>=0.40.0                           # Wheel format support
+pip>=23.0                               # Upgraded pip
+
+# ========================
+# CORE DEPENDENCIES
+# ========================
+streamlit>=1.35.0                       # Web UI framework
+python-dotenv>=1.0.0                    # Environment variable management
+
+# ========================
+# DATABASE
+# ========================
+# SQLite is built-in to Python 3.9+, no install needed
+
+# ========================
+# PDF PROCESSING
+# ========================
+pdfplumber>=0.11.0                      # PDF text extraction with wheels
+
+# ========================
+# DOCUMENT GENERATION
+# ========================
+python-docx>=1.0.0                      # Word document generation (has wheels)
+
+# ========================
+# AI/ML - LOCAL LLM & EMBEDDINGS
+# ========================
+requests>=2.31.0                        # HTTP client for Ollama API
+sentence-transformers>=2.3.0            # Embeddings for RAG (SentenceTransformer)
+numpy>=1.24.0                           # Numerical operations
+scikit-learn>=1.4.0                     # ML utilities (sklearn)
+
+# ========================
+# DEEP LEARNING (OPTIONAL)
+# ========================
+# For better performance, install with GPU support:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+torch>=2.0.0                            # PyTorch (used by SentenceTransformers)
+transformers>=4.36.0                    # Hugging Face transformers library
+
+# ========================
+# DATA & VISUALIZATION
+# ========================
+pandas>=2.0.0                           # Data manipulation (future use)
+
+# ========================
+# DEVELOPMENT & TESTING
+# ========================
+pytest>=7.4.0                           # Testing framework
+pytest-cov>=4.1.0                       # Coverage reporting
+black>=23.7.0                           # Code formatting
+pylint>=2.17.0                          # Linting
+flake8>=6.0.0                           # Style checking
+
+# ========================
+# LOGGING & MONITORING
+# ========================
+structlog>=23.1.0                       # Structured logging (optional enhancement)
+
+# ========================
+# INSTALLATION INSTRUCTIONS
+# ========================
+# 1. Create virtual environment:
+#    python -m venv venv
+#
+# 2. Activate virtual environment:
+#    Windows: venv\Scripts\Activate.ps1
+#    macOS/Linux: source venv/bin/activate
+#
+# 3. Upgrade pip, setuptools, and wheel (IMPORTANT - fixes build issues):
+#    python -m pip install --upgrade pip setuptools wheel
+#
+# 4. Install requirements:
+#    pip install -r requirements.txt
+#
+# If you get "Cannot import setuptools.build_meta" error:
+#    python -m pip install --upgrade pip setuptools wheel
+#    pip install -r requirements.txt --no-cache-dir
+#
+# For GPU acceleration (optional):
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#
+# For CPU-only (smaller install):
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# ========================
+# NOTES
+# ========================
+# - Versions are >=X.X.X (flexible) for compatibility with Python 3.9-3.13
+# - All packages have pre-built wheels for faster installation
+# - SentenceTransformers will auto-download models (~400MB on first use)
+# - Torch/Transformers download large files (~2GB total)
+# - Ollama must be installed separately: https://ollama.ai
+# - All dependencies tested on Python 3.13.12
