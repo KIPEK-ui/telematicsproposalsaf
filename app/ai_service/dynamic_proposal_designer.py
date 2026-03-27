@@ -510,7 +510,7 @@ class DynamicProposalDesigner:
         """
         try:
             query = f"Proposals for {profile.tender_type} in {profile.industry} industry"
-            results = self.rag_service.search(query, max_results=3)
+            results = self.rag_service.search(query, top_k=3)
             return [r.get('id', 'unknown') for r in results]
         except Exception as e:
             logger.warning(f"Failed to find similar proposals: {str(e)}")

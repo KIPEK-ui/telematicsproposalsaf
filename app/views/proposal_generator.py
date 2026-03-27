@@ -234,11 +234,11 @@ def render_step_1_tender_input():
             # Navigation buttons
             col1, col2 = st.columns([1, 1])
             with col1:
-                if st.button("⬅️ Back", use_container_width=True):
+                if st.button("⬅️ Back", width='stretch'):
                     st.session_state.step = max(1, st.session_state.step - 1)
                     st.rerun()
             with col2:
-                if st.button("Next: Organization Info ➡️", use_container_width=True):
+                if st.button("Next: Organization Info ➡️", width='stretch'):
                     st.session_state.step = 2
                     st.rerun()
     
@@ -324,11 +324,11 @@ def render_step_2_organization_info():
     # Navigation
     col1, col2 = st.columns([1, 1])
     with col1:
-        if st.button("⬅️ Back", use_container_width=True, key="back_2"):
+        if st.button("⬅️ Back", width='stretch', key="back_2"):
             st.session_state.step = 1
             st.rerun()
     with col2:
-        if st.button("Next: Design Proposal Structure ➡️", use_container_width=True, key="next_2"):
+        if st.button("Next: Design Proposal Structure ➡️", width='stretch', key="next_2"):
             if org_name and contact_email and contact_phone:
                 st.session_state.step = 3
                 st.rerun()
@@ -437,7 +437,7 @@ def render_step_3_structure_design():
                 "Key Points": ", ".join(section_def.key_points[:2]) if section_def.key_points else "—"
             })
         
-        st.dataframe(sections_data, use_container_width=True)
+        st.dataframe(sections_data, width='stretch')
     
     # Allow customization
     with st.expander("✏️ Customize Structure", expanded=False):
@@ -496,11 +496,11 @@ def render_step_3_structure_design():
     # Navigation
     col1, col2 = st.columns([1, 1])
     with col1:
-        if st.button("⬅️ Back", use_container_width=True, key="back_3_structure"):
+        if st.button("⬅️ Back", width='stretch', key="back_3_structure"):
             st.session_state.step = 2
             st.rerun()
     with col2:
-        if st.button("Next: Extract Requirements ➡️", use_container_width=True, key="next_3_structure"):
+        if st.button("Next: Extract Requirements ➡️", width='stretch', key="next_3_structure"):
             st.session_state.step = 4
             st.rerun()
 
@@ -612,93 +612,124 @@ def render_step_4_extract_requirements():
     with st.expander("📋 Extracted Requirements", expanded=True):
         requirements = st.session_state.requirements
         
-        # Create tabs for better organization
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "Fleet",
-            "Technical",
-            "Scope",
-            "Timeline",
-            "Budget & Compliance"
-        ])
-        
-        with tab1:
-            if requirements.fleet_requirements:
-                st.markdown("**Fleet Requirements:**")
-                for key, value in requirements.fleet_requirements.items():
-                    if value:
-                        st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
-            else:
-                st.info("No fleet requirements extracted")
-        
-        with tab2:
-            if requirements.technical_specifications:
-                st.markdown("**Technical Specifications:**")
-                for key, value in requirements.technical_specifications.items():
-                    if value:
-                        st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
-            else:
-                st.info("No technical specifications extracted")
-        
-        with tab3:
-            col1, col2 = st.columns(2)
-            with col1:
-                if requirements.scope_and_deliverables:
-                    st.markdown("**Scope & Deliverables:**")
-                    for key, value in requirements.scope_and_deliverables.items():
+        # Check if dynamic categories are available
+        if requirements.categories:
+            # Display dynamic categories
+            st.info(f"✨ AI-designed requirement categories for {requirements.categories.tender_type} ({requirements.categories.complexity})")
+            
+            # Create tabs for each category
+            category_names = requirements.categories.category_order
+            tabs = st.tabs(category_names)
+            
+            for i, (tab, cat_name) in enumerate(zip(tabs, category_names)):
+                with tab:
+                    category = requirements.categories.categories_dict.get(cat_name)
+                    if category:
+                        st.markdown(f"**{category.title}**")
+                        st.caption(category.description)
+                        st.divider()
+                        
+                        # Display extracted data for this category
+                        cat_data = requirements.requirements_dict.get(cat_name, {})
+                        if isinstance(cat_data, dict) and cat_data:
+                            for key, value in cat_data.items():
+                                if value and value != 'not specified':
+                                    st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+                        elif isinstance(cat_data, str) and cat_data:
+                            st.write(cat_data)
+                        else:
+                            st.info(f"No {category.title.lower()} extracted")
+        else:
+            # Fallback to legacy display
+            st.info("📌 Standard requirement categories")
+            
+            # Create tabs for better organization
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                "Fleet",
+                "Technical",
+                "Scope",
+                "Timeline",
+                "Budget & Compliance"
+            ])
+            
+            with tab1:
+                if requirements.fleet_requirements:
+                    st.markdown("**Fleet Requirements:**")
+                    for key, value in requirements.fleet_requirements.items():
                         if value:
                             st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
                 else:
-                    st.info("No scope information extracted")
+                    st.info("No fleet requirements extracted")
             
-            with col2:
-                if requirements.evaluation_criteria:
-                    st.markdown("**Evaluation Criteria:**")
-                    if isinstance(requirements.evaluation_criteria, dict):
-                        for key, value in requirements.evaluation_criteria.items():
+            with tab2:
+                if requirements.technical_specifications:
+                    st.markdown("**Technical Specifications:**")
+                    for key, value in requirements.technical_specifications.items():
+                        if value:
+                            st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+                else:
+                    st.info("No technical specifications extracted")
+            
+            with tab3:
+                col1, col2 = st.columns(2)
+                with col1:
+                    if requirements.scope_and_deliverables:
+                        st.markdown("**Scope & Deliverables:**")
+                        for key, value in requirements.scope_and_deliverables.items():
                             if value:
                                 st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
                     else:
-                        st.write(requirements.evaluation_criteria)
-        
-        with tab4:
-            if requirements.timeline_and_milestones:
-                st.markdown("**Timeline & Milestones:**")
-                for key, value in requirements.timeline_and_milestones.items():
-                    if value:
-                        st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
-            else:
-                st.info("No timeline information extracted")
-        
-        with tab5:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**Budget Constraints:**")
-                if requirements.budget_constraints:
-                    for key, value in requirements.budget_constraints.items():
-                        if value:
-                            st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
-                else:
-                    st.info("No budget information extracted")
+                        st.info("No scope information extracted")
+                
+                with col2:
+                    if requirements.evaluation_criteria:
+                        st.markdown("**Evaluation Criteria:**")
+                        if isinstance(requirements.evaluation_criteria, dict):
+                            for key, value in requirements.evaluation_criteria.items():
+                                if value:
+                                    st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+                        else:
+                            st.write(requirements.evaluation_criteria)
             
-            with col2:
-                st.markdown("**Compliance Requirements:**")
-                if requirements.compliance_requirements:
-                    for key, value in requirements.compliance_requirements.items():
+            with tab4:
+                if requirements.timeline_and_milestones:
+                    st.markdown("**Timeline & Milestones:**")
+                    for key, value in requirements.timeline_and_milestones.items():
                         if value:
                             st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
                 else:
-                    st.info("No compliance requirements extracted")
+                    st.info("No timeline information extracted")
+            
+            with tab5:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Budget Constraints:**")
+                    if requirements.budget_constraints:
+                        for key, value in requirements.budget_constraints.items():
+                            if value:
+                                st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+                    else:
+                        st.info("No budget information extracted")
+                
+                with col2:
+                    st.markdown("**Compliance Requirements:**")
+                    if requirements.compliance_requirements:
+                        for key, value in requirements.compliance_requirements.items():
+                            if value:
+                                st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+                    else:
+                        st.info("No compliance requirements extracted")
     
     st.info("ℹ️ Requirements have been extracted automatically. Click 'Next' to generate the proposal.")
     
     # Navigation
     col1, col2 = st.columns([1, 1])
     with col1:
-        if st.button("⬅️ Back", use_container_width=True, key="back_4"):
+        if st.button("⬅️ Back", width='stretch', key="back_4"):
             st.session_state.step = 3
             st.rerun()
     with col2:
-        if st.button("Next: Generate Proposal ➡️", use_container_width=True, key="next_4"):
+        if st.button("Next: Generate Proposal ➡️", width='stretch', key="next_4"):
             st.session_state.step = 5
             st.rerun()
 
@@ -793,14 +824,24 @@ def render_step_5_generate_proposal():
         return
     
     with st.expander("📄 Generated Dynamic Proposal", expanded=True):
+        # Metadata keys to skip - these should not be displayed as sections
+        METADATA_KEYS = {
+            'Cover Page', 'cover_page',
+            'Section Order', 'section_order',
+            'Design Rationale', 'design_rationale',
+            'Success Factors', 'success_factors',
+            'Proposal Structure', 'proposal_structure',
+            'section_names'
+        }
+        
         # Display cover page first if present
         if 'cover_page' in proposal.sections:
             st.subheader("📋 Cover Page")
             st.text(proposal.sections['cover_page'])
             st.divider()
         
-        # Create tabs dynamically based on design sections (excluding cover_page)
-        section_names = proposal.design.section_order
+        # Create tabs dynamically based on design sections (excluding cover_page and metadata)
+        section_names = [s for s in proposal.design.section_order if s not in METADATA_KEYS]
         
         # Create tabs for each section
         tabs = st.tabs([f"📋 {proposal.design.section_definitions[sec_name].title}" for sec_name in section_names])
@@ -832,11 +873,11 @@ def render_step_5_generate_proposal():
     # Navigation
     col1, col2 = st.columns([1, 1])
     with col1:
-        if st.button("⬅️ Back", use_container_width=True, key="back_5"):
+        if st.button("⬅️ Back", width='stretch', key="back_5"):
             st.session_state.step = 4
             st.rerun()
     with col2:
-        if st.button("Next: Refine & Export ➡️", use_container_width=True, key="next_5"):
+        if st.button("Next: Refine & Export ➡️", width='stretch', key="next_5"):
             st.session_state.step = 6
             st.rerun()
 
@@ -874,7 +915,7 @@ def render_step_6_refine_export():
             height=100
         )
         
-        if st.button("🔄 Regenerate Section", use_container_width=True):
+        if st.button("🔄 Regenerate Section", width='stretch'):
             if refinement_instruction.strip():
                 st.info("🔄 Refining section...")
                 try:
@@ -939,7 +980,7 @@ def render_step_6_refine_export():
     with col2:
         st.write("")  # Spacing
         st.write("")
-        if st.button("📥 Generate & Download", use_container_width=True, type="primary"):
+        if st.button("📥 Generate & Download", width='stretch', type="primary"):
             if not (export_branded or export_filled):
                 st.warning("⚠️ Please select at least one export format")
             else:
@@ -948,15 +989,9 @@ def render_step_6_refine_export():
                     
                     exporter = get_document_exporter()
                     
-                    # Convert dynamic proposal to export format
-                    export_data = {
-                        'title': st.session_state.tender_doc.title,
-                        'organization': st.session_state.org_data.get('name', 'Safaricom'),
-                        'sections': proposal.sections,
-                        'section_order': proposal.design.section_order,
-                        'design_rationale': proposal.design_rationale,
-                        'success_factors': proposal.success_factors
-                    }
+                    # Extract ONLY the proposal sections (no metadata)
+                    # Pass the flat sections dictionary to the exporter
+                    export_data = proposal.sections
                     
                     # Generate ZIP if both formats requested
                     if export_zip:
@@ -966,7 +1001,8 @@ def render_step_6_refine_export():
                             proposal_content=export_data,
                             org_data=st.session_state.org_data,
                             original_tender_path=st.session_state.tender_file_path,
-                            tender_title=st.session_state.tender_doc.title
+                            tender_title=st.session_state.tender_doc.title,
+                            tender_reference=st.session_state.tender_doc.reference if hasattr(st.session_state.tender_doc, 'reference') else ""
                         )
                         
                         # Save to database
@@ -987,7 +1023,7 @@ def render_step_6_refine_export():
                             data=zip_bytes,
                             file_name=f"{filename}_Dual_Export.zip",
                             mime="application/zip",
-                            use_container_width=True
+                            width='stretch'
                         )
                     
                     else:
@@ -998,7 +1034,8 @@ def render_step_6_refine_export():
                             docx_bytes = exporter.export_to_docx(
                                 proposal_content=export_data,
                                 org_data=st.session_state.org_data,
-                                tender_title=st.session_state.tender_doc.title
+                                tender_title=st.session_state.tender_doc.title,
+                                tender_reference=st.session_state.tender_doc.reference if hasattr(st.session_state.tender_doc, 'reference') else ""
                             )
                             
                             st.success("✅ Branded proposal generated!")
@@ -1008,7 +1045,7 @@ def render_step_6_refine_export():
                                 data=docx_bytes,
                                 file_name=f"{filename}_Branded.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                use_container_width=True
+                                width='stretch'
                             )
                         
                         if export_filled:
@@ -1027,7 +1064,7 @@ def render_step_6_refine_export():
                                 data=filled_bytes,
                                 file_name=f"{filename}_Filled_Tender.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                use_container_width=True
+                                width='stretch'
                             )
                         
                         # Save to database
@@ -1052,11 +1089,11 @@ def render_step_6_refine_export():
     # Navigation
     col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
-        if st.button("⬅️ Back", use_container_width=True, key="back_5"):
+        if st.button("⬅️ Back", width='stretch', key="back_5"):
             st.session_state.step = 4
             st.rerun()
     with col2:
-        if st.button("🔄 New Proposal", use_container_width=True):
+        if st.button("🔄 New Proposal", width='stretch'):
             for key in st.session_state:
                 del st.session_state[key]
             init_session_state()

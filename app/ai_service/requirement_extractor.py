@@ -6,8 +6,8 @@ Converts unstructured tender data into actionable requirements for proposal gene
 
 import json
 import logging
-from typing import Dict, Any, Optional
-from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, List
+from dataclasses import dataclass, asdict, field
 
 logger = logging.getLogger(__name__)
 
@@ -16,20 +16,76 @@ from app.ai_service.model_manager import get_model_manager, ModelConnectionError
 
 
 @dataclass
+class RequirementCategory:
+    """Definition of a dynamic requirement category."""
+    name: str  # Identifier (e.g., "security_requirements")
+    title: str  # Display title (e.g., "Security Requirements")
+    description: str  # What to look for in this category
+    importance: str  # "critical", "high", "medium", "low"
+    key_focus_areas: List[str]  # Specific areas to extract
+
+
+@dataclass
+class DynamicRequirementCategories:
+    """Dynamically designed requirement categories based on tender profile."""
+    categories: List[RequirementCategory]
+    category_order: List[str]  # Order to display categories
+    extraction_guidance: str  # Guidance for extraction
+    tender_type: str
+    industry: str
+    complexity: str
+    
+    @property
+    def category_names(self) -> List[str]:
+        """Get list of category names in order."""
+        return self.category_order
+    
+    @property
+    def categories_dict(self) -> Dict[str, RequirementCategory]:
+        """Create dictionary mapping names to categories."""
+        return {cat.name: cat for cat in self.categories}
+
+
+@dataclass
 class StructuredRequirements:
     """Structured representation of extracted requirements."""
-    fleet_requirements: Dict[str, Any]
-    technical_specifications: Dict[str, Any]
-    scope_and_deliverables: Dict[str, Any]
-    timeline_and_milestones: Dict[str, Any]
-    budget_constraints: Dict[str, Any]
-    compliance_requirements: Dict[str, Any]
-    evaluation_criteria: Dict[str, Any]
-    additional_notes: str
+    # Support both static and dynamic categories
+    requirements_dict: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    categories: Optional[DynamicRequirementCategories] = None
+    additional_notes: str = ""
+    
+    # Legacy fields for backward compatibility
+    fleet_requirements: Dict[str, Any] = field(default_factory=dict)
+    technical_specifications: Dict[str, Any] = field(default_factory=dict)
+    scope_and_deliverables: Dict[str, Any] = field(default_factory=dict)
+    timeline_and_milestones: Dict[str, Any] = field(default_factory=dict)
+    budget_constraints: Dict[str, Any] = field(default_factory=dict)
+    compliance_requirements: Dict[str, Any] = field(default_factory=dict)
+    evaluation_criteria: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return asdict(self)
+        base_dict = {
+            'requirements_dict': self.requirements_dict,
+            'additional_notes': self.additional_notes,
+            'fleet_requirements': self.fleet_requirements,
+            'technical_specifications': self.technical_specifications,
+            'scope_and_deliverables': self.scope_and_deliverables,
+            'timeline_and_milestones': self.timeline_and_milestones,
+            'budget_constraints': self.budget_constraints,
+            'compliance_requirements': self.compliance_requirements,
+            'evaluation_criteria': self.evaluation_criteria,
+        }
+        if self.categories:
+            base_dict['categories'] = {
+                'categories': [asdict(c) for c in self.categories.categories],
+                'category_order': self.categories.category_order,
+                'extraction_guidance': self.categories.extraction_guidance,
+                'tender_type': self.categories.tender_type,
+                'industry': self.categories.industry,
+                'complexity': self.categories.complexity,
+            }
+        return base_dict
 
 
 class RequirementExtractionError(Exception):
@@ -335,6 +391,21 @@ Remember: Form templates and instructions are NEVER actual requirements."""
             complexity = complexity or 'moderate'
             priority_areas = priority_areas or []
             
+            # Design dynamic requirement categories for this tender
+            if progress_callback:
+                progress_callback(3, 6, "designing_categories")
+            
+            category_designer = get_requirement_category_designer()
+            dynamic_categories = category_designer.design_categories(
+                tender_type=tender_type,
+                industry=industry,
+                complexity=complexity,
+                key_themes=priority_areas,  # Use priority areas as themes
+                priority_areas=priority_areas
+            )
+            
+            logger.info(f"Designed {len(dynamic_categories.categories)} requirement categories")
+            
             # Get extraction guidance based on industry and complexity
             extraction_guidance = self._get_extraction_guidance(industry, complexity, priority_areas)
             
@@ -383,8 +454,34 @@ Remember: Form templates and instructions are NEVER actual requirements."""
             # Clean extracted data - remove template/placeholder text
             extracted_data = self._clean_extracted_data(extracted_data)
             
-            # Create structured requirements
+            # Build dynamic requirements dictionary from extracted data
+            requirements_dict = {}
+            for cat in dynamic_categories.categories:
+                # Try to find matching data from extraction
+                # Map old category names to new ones if needed
+                cat_name = cat.name
+                requirements_dict[cat_name] = extracted_data.get(cat_name, {})
+                
+                # also try common aliases
+                if not requirements_dict[cat_name]:
+                    if 'scope' in cat_name.lower():
+                        requirements_dict[cat_name] = extracted_data.get('scope_and_deliverables', {})
+                    elif 'timeline' in cat_name.lower():
+                        requirements_dict[cat_name] = extracted_data.get('timeline_and_milestones', {})
+                    elif 'budget' in cat_name.lower() or 'pricing' in cat_name.lower():
+                        requirements_dict[cat_name] = extracted_data.get('budget_constraints', {})
+                    elif 'technical' in cat_name.lower():
+                        requirements_dict[cat_name] = extracted_data.get('technical_specifications', {})
+                    elif 'compliance' in cat_name.lower():
+                        requirements_dict[cat_name] = extracted_data.get('compliance_requirements', {})
+            
+            # Create structured requirements with both legacy and dynamic fields
             requirements = StructuredRequirements(
+                # New dynamic fields
+                requirements_dict=requirements_dict,
+                categories=dynamic_categories,
+                additional_notes=extracted_data.get('additional_notes', ''),
+                # Legacy fields for backward compatibility
                 fleet_requirements=extracted_data.get('fleet_requirements', {}),
                 technical_specifications=extracted_data.get('technical_specifications', {}),
                 scope_and_deliverables=extracted_data.get('scope_and_deliverables', {}),
@@ -392,7 +489,6 @@ Remember: Form templates and instructions are NEVER actual requirements."""
                 budget_constraints=extracted_data.get('budget_constraints', {}),
                 compliance_requirements=extracted_data.get('compliance_requirements', {}),
                 evaluation_criteria=extracted_data.get('evaluation_criteria', {}),
-                additional_notes=extracted_data.get('additional_notes', '')
             )
             
             logger.info("Requirement extraction completed successfully")
@@ -799,9 +895,277 @@ Provide the refined version as valid JSON. Only output the refined value, no oth
             raise RequirementExtractionError(f"Refinement failed: {str(e)}")
 
 
+# ========================
+# Dynamic Requirement Category Designer
+# ========================
+
+class RequirementCategoryDesigner:
+    """
+    Designs dynamic requirement categories based on tender profile.
+    Similar to DynamicProposalDesigner but for requirements extraction.
+    Creates tailored extraction guidance and category structure.
+    """
+    
+    def design_categories(
+        self,
+        tender_type: str,
+        industry: str,
+        complexity: str,
+        key_themes: List[str],
+        priority_areas: List[str]
+    ) -> DynamicRequirementCategories:
+        """
+        Design dynamic requirement categories for a tender.
+        
+        Args:
+            tender_type: Type of tender (e.g., 'sms_services', 'cloud_hosting')
+            industry: Industry context (e.g., 'telecom', 'cloud')
+            complexity: Tender complexity ('simple', 'moderate', 'complex')
+            key_themes: Key themes in the tender (e.g., ['security', 'cost_efficiency'])
+            priority_areas: Areas buyer cares about most
+            
+        Returns:
+            DynamicRequirementCategories: Dynamically designed categories
+        """
+        logger.info(f"Designing requirement categories for {tender_type} ({complexity})")
+        
+        # Base categories that apply to all tenders
+        base_categories = {
+            'scope_deliverables': RequirementCategory(
+                name='scope_deliverables',
+                title='Scope & Deliverables',
+                description='What needs to be delivered and when',
+                importance='critical',
+                key_focus_areas=['Services', 'Deliverables', 'Scope', 'Outputs']
+            ),
+            'timeline_milestones': RequirementCategory(
+                name='timeline_milestones',
+                title='Timeline & Milestones',
+                description='Key dates, phases, and milestones',
+                importance='critical',
+                key_focus_areas=['Timeline', 'Start date', 'End date', 'Milestones', 'Phases']
+            ),
+            'budget_pricing': RequirementCategory(
+                name='budget_pricing',
+                title='Budget & Pricing',
+                description='Cost constraints, budget limits, pricing models',
+                importance='high',
+                key_focus_areas=['Budget', 'Cost', 'Price', 'Amount', 'Financial']
+            ),
+        }
+        
+        # Add complexity-aware categories
+        additional_categories = {}
+        
+        if complexity in ['moderate', 'complex']:
+            additional_categories['technical_specs'] = RequirementCategory(
+                name='technical_specs',
+                title='Technical Specifications',
+                description='Technical requirements and specifications',
+                importance='high',
+                key_focus_areas=['Technical', 'Specifications', 'Technical specs', 'Architecture', 'System']
+            )
+        
+        if complexity == 'complex':
+            additional_categories['compliance_security'] = RequirementCategory(
+                name='compliance_security',
+                title='Compliance & Security',
+                description='Security, compliance, and regulatory requirements',
+                importance='critical',
+                key_focus_areas=['Security', 'Compliance', 'Regulations', 'Standards', 'Encryption', 'Audit']
+            )
+        
+        # Add industry-specific categories
+        industry_categories = self._get_industry_specific_categories(industry, complexity)
+        
+        # Add theme-specific categories
+        theme_categories = self._get_theme_specific_categories(key_themes, priority_areas, complexity)
+        
+        # Combine all categories
+        all_categories = {**base_categories, **additional_categories, **industry_categories, **theme_categories}
+        
+        # Sort by importance and priority
+        category_order = self._order_categories(all_categories, priority_areas)
+        
+        # Create extraction guidance
+        extraction_guidance = self._create_extraction_guidance(tender_type, industry, complexity, key_themes)
+        
+        return DynamicRequirementCategories(
+            categories=list(all_categories.values()),
+            category_order=category_order,
+            extraction_guidance=extraction_guidance,
+            tender_type=tender_type,
+            industry=industry,
+            complexity=complexity
+        )
+    
+    def _get_industry_specific_categories(
+        self,
+        industry: str,
+        complexity: str
+    ) -> Dict[str, RequirementCategory]:
+        """Get industry-specific requirement categories."""
+        categories = {}
+        
+        if industry == 'telecom':
+            categories['service_quality'] = RequirementCategory(
+                name='service_quality',
+                title='Service Quality & SLAs',
+                description='Service level agreements, uptime, performance metrics',
+                importance='critical' if complexity == 'complex' else 'high',
+                key_focus_areas=['SLA', 'Uptime', 'Availability', 'Performance', 'Response time']
+            )
+            categories['coverage'] = RequirementCategory(
+                name='coverage',
+                title='Coverage & Infrastructure',
+                description='Coverage areas, network infrastructure, capacity',
+                importance='high',
+                key_focus_areas=['Coverage', 'Geographic', 'Regional', 'Capacity', 'Infrastructure']
+            )
+        
+        elif industry == 'cloud':
+            categories['cloud_infrastructure'] = RequirementCategory(
+                name='cloud_infrastructure',
+                title='Cloud Infrastructure',
+                description='Cloud services, deployment model, regions',
+                importance='high',
+                key_focus_areas=['AWS', 'Azure', 'GCP', 'Deployment', 'Instance', 'Virtual', 'Regions']
+            )
+            categories['disaster_recovery'] = RequirementCategory(
+                name='disaster_recovery',
+                title='Disaster Recovery & Redundancy',
+                description='Backup, failover, disaster recovery, data replication',
+                importance='high',
+                key_focus_areas=['Disaster', 'Recovery', 'Backup', 'Failover', 'Redundancy', 'Replication']
+            )
+        
+        elif industry == 'wifi':
+            categories['coverage_capacity'] = RequirementCategory(
+                name='coverage_capacity',
+                title='Coverage & Capacity',
+                description='Coverage area, user capacity, bandwidth requirements',
+                importance='critical',
+                key_focus_areas=['Coverage', 'Capacity', 'Concurrent users', 'Bandwidth', 'Access points']
+            )
+        
+        elif industry == 'fleet' or industry == 'transport':
+            categories['fleet_specs'] = RequirementCategory(
+                name='fleet_specs',
+                title='Fleet Requirements',
+                description='Fleet size, vehicle types, specifications',
+                importance='critical',
+                key_focus_areas=['Fleet', 'Vehicles', 'Units', 'Type', 'Specifications']
+            )
+            categories['maintenance'] = RequirementCategory(
+                name='maintenance',
+                title='Maintenance & Support',
+                description='Maintenance schedule, support requirements',
+                importance='high',
+                key_focus_areas=['Maintenance', 'Support', 'Service', 'Repair', 'Availability']
+            )
+        
+        return categories
+    
+    def _get_theme_specific_categories(
+        self,
+        key_themes: List[str],
+        priority_areas: List[str],
+        complexity: str
+    ) -> Dict[str, RequirementCategory]:
+        """Get categories based on tender themes and priorities."""
+        categories = {}
+        all_themes = set(key_themes + priority_areas)
+        
+        theme_mapping = {
+            'security': RequirementCategory(
+                name='security_requirements',
+                title='Security Requirements',
+                description='Security measures, encryption, authentication, access control',
+                importance='critical',
+                key_focus_areas=['Security', 'Encryption', 'Authentication', 'Firewall', 'Access control']
+            ),
+            'cost_efficiency': RequirementCategory(
+                name='cost_optimization',
+                title='Cost Optimization',
+                description='Cost reduction strategies, efficiency metrics, ROI',
+                importance='high',
+                key_focus_areas=['Cost', 'Efficiency', 'Savings', 'ROI', 'Optimization']
+            ),
+            'scalability': RequirementCategory(
+                name='scalability_growth',
+                title='Scalability & Growth',
+                description='Scalability, growth capacity, future expansion',
+                importance='high',
+                key_focus_areas=['Scalability', 'Growth', 'Expansion', 'Capacity increase', 'Upgrade']
+            ),
+            'integration': RequirementCategory(
+                name='integration_compatibility',
+                title='Integration & Compatibility',
+                description='System integration, API compatibility, third-party integration',
+                importance='high',
+                key_focus_areas=['Integration', 'API', 'Compatibility', 'Third-party', 'Interface']
+            ),
+            'innovation': RequirementCategory(
+                name='innovation_features',
+                title='Innovation & Features',
+                description='New features, innovative solutions, technology advancements',
+                importance='medium',
+                key_focus_areas=['Innovation', 'Features', 'Technology', 'New', 'Advanced']
+            ),
+        }
+        
+        for theme in all_themes:
+            if theme.lower() in theme_mapping:
+                categories[theme.lower()] = theme_mapping[theme.lower()]
+        
+        return categories
+    
+    def _order_categories(
+        self,
+        categories: Dict[str, RequirementCategory],
+        priority_areas: List[str]
+    ) -> List[str]:
+        """Order categories by importance and priority."""
+        # Sort categories: critical first, then high, then medium, then low
+        # Within same importance, prioritize by priority_areas
+        
+        importance_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+        
+        def sort_key(cat_name: str) -> tuple:
+            cat = categories[cat_name]
+            importance_rank = importance_order.get(cat.importance, 4)
+            
+            # Check if this category matches a priority area
+            priority_rank = 99
+            for i, priority in enumerate(priority_areas):
+                if priority.lower() in cat.title.lower() or priority.lower() in cat.name.lower():
+                    priority_rank = i
+                    break
+            
+            return (importance_rank, priority_rank)
+        
+        return sorted(categories.keys(), key=sort_key)
+    
+    def _create_extraction_guidance(
+        self,
+        tender_type: str,
+        industry: str,
+        complexity: str,
+        key_themes: List[str]
+    ) -> str:
+        """Create extraction guidance based on tender profile."""
+        guidance = f"""Extract requirements specific to this {industry.title()} tender ({complexity} complexity).
+Focus on: {', '.join(key_themes) if key_themes else 'general requirements'}
+Priority: Extract ACTUAL requirements only, not template placeholders or form fields.
+Template indicators to ignore: [...], [indicate ...], _____, (specify), (optional), parenthetical instructions"""
+        
+        return guidance
+
+
 # Singleton instances
 _extractor: Optional[RequirementExtractor] = None
 _refiner: Optional[RequirementRefiner] = None
+_category_designer: Optional[RequirementCategoryDesigner] = None
 
 
 def get_requirement_extractor() -> RequirementExtractor:
@@ -818,3 +1182,11 @@ def get_requirement_refiner() -> RequirementRefiner:
     if _refiner is None:
         _refiner = RequirementRefiner()
     return _refiner
+
+
+def get_requirement_category_designer() -> RequirementCategoryDesigner:
+    """Get or create requirement category designer instance."""
+    global _category_designer
+    if _category_designer is None:
+        _category_designer = RequirementCategoryDesigner()
+    return _category_designer
