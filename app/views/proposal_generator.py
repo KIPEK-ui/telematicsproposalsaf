@@ -509,13 +509,13 @@ def render_step_3_structure_design():
 # Step 3: Requirements Extraction
 # ========================
 
-def render_step_3_extract_requirements():
+def render_step_4_extract_requirements():
     """Render requirement extraction step."""
     if st.session_state.tender_doc is None or st.session_state.org_data is None:
         st.warning("⚠️ Please complete previous steps first")
         return
     
-    st.subheader("Step 3: Extract & Review Requirements")
+    st.subheader("Step 4: Extract & Review Requirements")
     
     # Add Fast Mode option
     col1, col2 = st.columns([3, 1])
@@ -842,16 +842,16 @@ def render_step_5_generate_proposal():
 
 
 # ========================
-# Step 5: Refine & Export
+# Step 6: Refine & Export
 # ========================
 
-def render_step_5_refine_export():
+def render_step_6_refine_export():
     """Render refinement and export step."""
     if st.session_state.proposal_content is None:
         st.warning("⚠️ Please generate proposal first")
         return
     
-    st.subheader("Step 5: Refine & Export Proposal")
+    st.subheader("Step 6: Refine & Export Proposal")
     
     proposal = st.session_state.proposal_content
     
