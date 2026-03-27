@@ -4,6 +4,10 @@ Streamlit interface for uploading, managing, and processing documents for RAG tr
 Integrated into the main proposal generator workflow.
 """
 
+import os
+# Disable PaddleOCR model source check for faster startup
+os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
+
 import streamlit as st
 import logging
 from typing import Optional
@@ -392,20 +396,43 @@ def render_statistics_tab(doc_manager):
         rag = get_rag_service()
         doc_count = len(rag.documents)
         
-        col1, col2 = st.columns(2)
-        with col1:
-            if doc_count > 0:
-                st.success(f"✅ RAG Active ({doc_count} documents indexed)")
-            else:
-                st.warning("⚠️ No documents indexed in RAG yet")
-                st.caption("Process uploaded documents to index them for RAG context")
+        # Get detailed training data status
+        training_status = rag.check_training_data_status()
         
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("📚 Loaded Proposals", training_status['loaded_proposals'])
         with col2:
-            if st.button("🔄 Rebuild RAG Index"):
+            st.metric("⏳ Pending Files", training_status['pending_files_count'])
+        with col3:
+            status_label = training_status['status'].upper()
+            status_emoji = "🟢" if training_status['status'] == 'ready' else "🟡" if training_status['status'] == 'pending' else "🔴"
+            st.metric("Status", f"{status_emoji} {status_label}")
+        
+        st.divider()
+        
+        # Status details
+        if training_status['status'] == 'ready':
+            st.success(f"✅ RAG is active with {training_status['loaded_proposals']} indexed proposal(s)")
+        elif training_status['status'] == 'pending':
+            st.warning(f"⏳ {training_status['pending_files_count']} file(s) waiting to be processed")
+            if training_status['pending_files']:
+                st.caption("**Files to process:**")
+                for fname in training_status['pending_files']:
+                    st.caption(f"  • {fname}")
+        else:
+            st.info("📭 No training data available yet. Start by uploading documents.")
+        
+        # Next steps
+        st.caption(f"**Next Step**: {training_status['next_steps']}")
+        
+        # Rebuild button
+        if doc_count > 0 or training_status['pending_files_count'] > 0:
+            if st.button("🔄 Refresh RAG Index", help="Reload and reindex all processed training documents"):
                 with st.spinner("Rebuilding index..."):
                     try:
                         count = rag.rebuild_index()
-                        st.success(f"✅ Index rebuilt with {count} documents!")
+                        st.success(f"✅ Index rebuilt with {count} document(s)!")
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ Error: {str(e)}")

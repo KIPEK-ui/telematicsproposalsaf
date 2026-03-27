@@ -4,17 +4,22 @@ Main Streamlit interface for AI-assisted proposal generation.
 Multi-step workflow: Tender Input → Organization Info → Extract Requirements → Generate → Refine → Export
 """
 
+import os
+# Disable PaddleOCR model source check for faster startup
+os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
+
 import streamlit as st
 import logging
 from typing import Optional, Dict, Any
 import io
+import hashlib
 
 from app.services.local_db_service import get_db_service
 from app.services.tender_parser import TenderParserFactory, TenderParsingError, TenderDocument
+from app.services.temp_file_manager import TemporaryFileManager
 from app.ai_service.model_manager import get_model_manager, ModelConnectionError
 from app.ai_service.requirement_extractor import get_requirement_extractor, RequirementExtractionError, StructuredRequirements
-from app.ai_service.proposal_generator import get_proposal_generator, ProposalGenerationError, ProposalSection
-from app.ai_service.dynamic_proposal_designer import TenderClassifier, DynamicProposalDesigner
+from app.ai_service.dynamic_proposal_designer import TenderClassifier, DynamicProposalDesigner, TenderProfile
 from app.ai_service.enhanced_proposal_generator import EnhancedProposalGenerator
 from app.services.document_exporter import get_document_exporter, DocumentExportError
 
@@ -31,6 +36,16 @@ st.set_page_config(
 )
 
 # ========================
+# Session-Level Caching (NEW)
+# ========================
+
+@st.cache_resource
+def get_rag_service_cached():
+    """Cache RAG service initialization."""
+    from app.ai_service.rag_service import get_rag_service
+    return get_rag_service()
+
+# ========================
 # Session State Initialization
 # ========================
 
@@ -40,6 +55,8 @@ def init_session_state():
         'step': 1,
         'tender_doc': None,
         'tender_id': None,
+        'tender_file_path': None,  # Store original tender file path for form filling
+        'tender_file_bytes': None,  # Store original tender file bytes for form filling
         'org_data': None,
         'requirements': None,
         'proposal_content': None,
@@ -72,13 +89,13 @@ def render_header():
     step_labels = {
         1: "1️⃣ Tender Input",
         2: "2️⃣ Organization",
-        2.5: "2️⃣.5️⃣ Structure Design",
-        3: "3️⃣ Requirements",
-        4: "4️⃣ Generate",
-        5: "5️⃣ Refine & Export"
+        3: "3️⃣ Structure Design",
+        4: "4️⃣ Requirements",
+        5: "5️⃣ Generate",
+        6: "6️⃣ Refine & Export"
     }
     
-    progress = st.progress(min(st.session_state.step / 5.5, 1.0))
+    progress = st.progress(min(st.session_state.step / 6.0, 1.0))
     current_step_label = step_labels.get(st.session_state.step, "Unknown Step")
     st.caption(f"Step {st.session_state.step}: {current_step_label}")
 
@@ -103,13 +120,30 @@ def render_step_1_tender_input():
     
     try:
         if input_method == "📄 Upload PDF":
-            uploaded_file = st.file_uploader("Upload PDF tender document", type=['pdf'])
+            uploaded_file = st.file_uploader(
+                "Upload tender document (PDF, DOCX, or TXT)", 
+                type=['pdf', 'docx', 'doc', 'txt'],
+                help="Supported formats: PDF, DOCX, DOC, TXT"
+            )
             if uploaded_file:
-                st.info("📤 Processing PDF...")
+                file_ext = uploaded_file.name.split('.')[-1].lower()
+                st.info(f"📤 Processing {file_ext.upper()} file...")
                 file_bytes = uploaded_file.read()
-                tender_doc = TenderParserFactory.parse_pdf(file_bytes)
-                tender_title = uploaded_file.name
-                st.success(f"✅ PDF parsed successfully: {tender_doc.title}")
+                try:
+                    tender_doc = TenderParserFactory.parse_file(file_bytes, uploaded_file.name)
+                    tender_title = uploaded_file.name
+                    
+                    # Create temporary file for form filling operations
+                    temp_file_path = TemporaryFileManager.create_temp_file(
+                        file_bytes, 
+                        uploaded_file.name
+                    )
+                    st.session_state.tender_file_bytes = file_bytes
+                    st.session_state.tender_file_path = temp_file_path
+                    
+                    st.success(f"✅ {file_ext.upper()} parsed successfully: {tender_doc.title}")
+                except Exception as e:
+                    st.error(f"❌ Error parsing {file_ext.upper()}: {str(e)}")
         
         elif input_method == "📝 Paste Text/Email":
             st.write("Paste tender content from email or document:")
@@ -119,7 +153,7 @@ def render_step_1_tender_input():
                 placeholder="Paste tender text here...",
                 key="tender_text_input"
             )
-            tender_title_input = st.text_input("Tender Title (optional)", value="")
+            tender_title_input = st.text_area("Tender Title (optional)", height=80, placeholder="Enter tender title")
             
             if text_content.strip():
                 tender_doc = TenderParserFactory.parse_text(
@@ -133,12 +167,26 @@ def render_step_1_tender_input():
             st.write("Fill in the tender details:")
             
             form_data = {}
-            form_data['title'] = st.text_input("Tender Title *", placeholder="e.g., Vehicle Fleet Management Services")
+            
+            # Tender title field (multi-line to capture full titles)
+            form_data['title'] = st.text_area("Tender Title *", height=80, placeholder="e.g., Vehicle Fleet Management Services for 3 years")
+            
+            # Two-column layout for additional fields (all multi-line to capture full content)
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                form_data['tender_no'] = st.text_area("Tender No.", height=60, placeholder="Enter tender reference number")
+                form_data['email'] = st.text_area("Email", height=60, placeholder="Enter contact email(s)")
+                form_data['timeline'] = st.text_area("Timeline/Deadline", height=60, placeholder="e.g., Closing date: Jan 15, 2025 at 11:00 am")
+            
+            with col2:
+                form_data['address'] = st.text_area("Address", height=60, placeholder="Enter tender issuer address")
+                form_data['bid_validity'] = st.text_area("Bid Validity", height=60, placeholder="e.g., 90 days from submission date")
+                form_data['budget'] = st.text_area("Budget/Pricing Range", height=60, placeholder="e.g., KES 5,000,000 - 7,500,000")
+            
             form_data['description'] = st.text_area("Description/Overview", height=100)
             form_data['requirements'] = st.text_area("Technical Requirements", height=100)
             form_data['fleet_details'] = st.text_area("Fleet & Equipment Details", height=100)
-            form_data['timeline'] = st.text_input("Timeline/Deadline")
-            form_data['budget'] = st.text_input("Budget/Pricing Range")
             
             if form_data['title']:
                 tender_doc = TenderParserFactory.parse_form(form_data)
@@ -148,15 +196,24 @@ def render_step_1_tender_input():
         # Display tender summary
         if tender_doc:
             with st.expander("📋 Tender Summary", expanded=True):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write(f"**Title:** {tender_doc.title}")
-                    st.write(f"**Source:** {tender_doc.source_type.value}")
-                with col2:
-                    if tender_doc.timeline:
-                        st.write(f"**Timeline:** {tender_doc.timeline}")
-                    if tender_doc.budget_info:
-                        st.write(f"**Budget:** {tender_doc.budget_info}")
+                # Full-width single column to allow multi-line text wrapping
+                st.write(f"**Title:** {tender_doc.title}")
+                st.write(f"**Source:** {tender_doc.source_type.value}")
+                if tender_doc.tender_no:
+                    st.write(f"**Tender No.:** {tender_doc.tender_no}")
+                if tender_doc.address:
+                    st.write(f"**Address:**")
+                    st.markdown(tender_doc.address.replace('\n', '  \n'))  # Preserve line breaks in markdown
+                if tender_doc.email:
+                    st.write(f"**Email:** {tender_doc.email}")
+                if tender_doc.phone_number:
+                    st.write(f"**Phone:** {tender_doc.phone_number}")
+                if tender_doc.bid_validity:
+                    st.write(f"**Bid Validity:** {tender_doc.bid_validity}")
+                if tender_doc.timeline:
+                    st.write(f"**Timeline:** {tender_doc.timeline}")
+                if tender_doc.budget_info:
+                    st.write(f"**Budget:** {tender_doc.budget_info}")
             
             # Save to database and proceed
             if st.session_state.tender_doc is None:
@@ -232,8 +289,10 @@ def render_step_2_organization_info():
         )
     
     with col2:
-        contact_email = st.text_input(
-            "Primary Contact Email *",
+        contact_email = st.text_area(
+            "Primary Contact Email(s) *",
+            height=80,
+            placeholder="Enter email(s), one per line",
             value=st.session_state.org_data.get('contact_email', '') if st.session_state.org_data else ''
         )
         contact_phone = st.text_input(
@@ -241,8 +300,10 @@ def render_step_2_organization_info():
             value=st.session_state.org_data.get('contact_phone', '') if st.session_state.org_data else ''
         )
     
-    address = st.text_input(
+    address = st.text_area(
         "Address",
+        height=80,
+        placeholder="Enter complete mailing address",
         value=st.session_state.org_data.get('address', '') if st.session_state.org_data else ''
     )
     
@@ -269,61 +330,69 @@ def render_step_2_organization_info():
     with col2:
         if st.button("Next: Design Proposal Structure ➡️", use_container_width=True, key="next_2"):
             if org_name and contact_email and contact_phone:
-                st.session_state.step = 2.5
+                st.session_state.step = 3
                 st.rerun()
             else:
                 st.error("❌ Please fill in all required fields")
 
 
 # ========================
-# Step 2.5: Design Proposal Structure
+# Step 3: Design Proposal Structure
 # ========================
 
-def render_step_25_structure_design():
+def render_step_3_structure_design():
     """Render proposal structure design step using dynamic designer."""
     if st.session_state.tender_doc is None or st.session_state.org_data is None:
         st.warning("⚠️ Please complete previous steps first")
         return
     
-    st.subheader("Step 2.5: Design Proposal Structure (Dynamic)")
+    st.subheader("Step 3: Design Proposal Structure (Dynamic)")
     st.write("AI will analyze your tender and design an optimal proposal structure...")
     
     if st.session_state.tender_profile is None or st.session_state.proposal_structure is None:
-        # Classify tender and design structure
-        col1, col2 = st.columns(2)
-        
+        # Progress tracking containers
+        col1, col2 = st.columns([2, 1])
         with col1:
-            st.info("🔄 Analyzing tender...")
+            status_text = st.empty()
+        with col2:
+            progress_placeholder = st.empty()
+        
+        progress_bar = st.progress(0, text="Initializing...")
         
         try:
+            # Define progress callback
+            def update_structure_progress(current: int, total: int, step_name: str):
+                """Update progress for structure design."""
+                progress_pct = current / total
+                display_name = step_name.replace('_', ' ').title()
+                
+                progress_bar.progress(
+                    progress_pct,
+                    text=f"Designing proposal... {display_name}..."
+                )
+                with status_text.container():
+                    st.caption(f"Step: {current}/{total} | {display_name}")
+                with progress_placeholder.container():
+                    st.metric("Progress", f"{current}/{total}")
+            
             # Step 1: Classify tender
             classifier = TenderClassifier()
-            tender_profile = classifier.classify(st.session_state.tender_doc)
+            tender_profile = classifier.classify(st.session_state.tender_doc, progress_callback=update_structure_progress)
             st.session_state.tender_profile = tender_profile
-            
-            with col1:
-                st.success("✅ Tender classified")
-            
-            with col2:
-                st.info("🔄 Designing structure...")
             
             # Step 2: Design proposal structure
             designer = DynamicProposalDesigner()
             
-            # Get RAG service for similar proposals context
-            from app.ai_service.rag_service import get_rag_service
-            rag_service = get_rag_service()
-            
             proposal_structure = designer.design_structure(
                 tender_doc=st.session_state.tender_doc,
                 tender_profile=tender_profile,
-                rag_service=rag_service,
-                org_context=st.session_state.org_data
+                progress_callback=update_structure_progress
             )
             st.session_state.proposal_structure = proposal_structure
             
-            with col2:
-                st.success("✅ Structure designed")
+            progress_bar.progress(1.0, text="✅ Structure designed successfully!")
+            with status_text.container():
+                st.success("✅ Tender analysis and structure design complete!")
         
         except Exception as e:
             st.error(f"❌ Design Error: {str(e)}")
@@ -343,7 +412,7 @@ def render_step_25_structure_design():
             st.metric("Complexity", profile.complexity.title())
         
         st.write("**Key Themes:**", ", ".join(profile.key_themes) if profile.key_themes else "General")
-        st.write("**Buyer Priorities:**", ", ".join(profile.buyer_priorities) if profile.buyer_priorities else "Standard")
+        st.write("**Buyer Priorities:**", ", ".join(profile.priority_areas) if profile.priority_areas else "Standard")
     
     # Display proposed structure
     with st.expander("📋 Proposed Proposal Structure", expanded=True):
@@ -427,12 +496,12 @@ def render_step_25_structure_design():
     # Navigation
     col1, col2 = st.columns([1, 1])
     with col1:
-        if st.button("⬅️ Back", use_container_width=True, key="back_25"):
+        if st.button("⬅️ Back", use_container_width=True, key="back_3_structure"):
             st.session_state.step = 2
             st.rerun()
     with col2:
-        if st.button("Next: Extract Requirements ➡️", use_container_width=True, key="next_25"):
-            st.session_state.step = 3
+        if st.button("Next: Extract Requirements ➡️", use_container_width=True, key="next_3_structure"):
+            st.session_state.step = 4
             st.rerun()
 
 
@@ -448,31 +517,85 @@ def render_step_3_extract_requirements():
     
     st.subheader("Step 3: Extract & Review Requirements")
     
+    # Add Fast Mode option
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.write("**Extraction Mode:**")
+    with col2:
+        use_fast_mode = st.checkbox(
+            "⚡ Fast Mode",
+            value=False,
+            help="Skip LLM (use pattern-based extraction) for faster processing"
+        )
+    
     if st.session_state.requirements is None:
         # Extract requirements
-        st.info("🔄 Initializing LLM and extracting requirements...")
+        if use_fast_mode:
+            st.info("⚡ Using fast pattern-based extraction...")
+        else:
+            st.info("🔄 Using LLM-based extraction (slower but more accurate)...")
+        
+        # Progress tracking containers
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            status_text = st.empty()
+        with col2:
+            progress_placeholder = st.empty()
+        
+        progress_bar = st.progress(0, text="Initializing...")
         
         try:
-            # Initialize model
-            if not st.session_state.model_initialized:
-                model_manager = get_model_manager()
-                if not model_manager.check_ollama_availability():
-                    st.error(
-                        "❌ Ollama not available. Please install and start Ollama:\n\n"
-                        "1. Download from https://ollama.ai\n"
-                        "2. Run: `ollama serve`\n"
-                        "3. In another terminal: `ollama pull llama3.1:8b`\n"
-                        "4. Or: `ollama pull mistral:7b-instruct` for faster generation"
-                    )
-                    st.stop()
-                model_manager.load_model()
-                st.session_state.model_initialized = True
+            # Initialize model only if NOT using fast mode
+            if not use_fast_mode:
+                if not st.session_state.model_initialized:
+                    model_manager = get_model_manager()
+                    if not model_manager.check_ollama_availability():
+                        st.error(
+                            "❌ Ollama not available. Please install and start Ollama:\n\n"
+                            "1. Download from https://ollama.ai\n"
+                            "2. Run: `ollama serve`\n"
+                            "3. In another terminal: `ollama pull mistral:7b` (fastest)"
+                        )
+                        st.stop()
+                    model_manager.load_model()
+                    st.session_state.model_initialized = True
             
-            # Extract requirements
+            # Define progress callback
+            def update_extraction_progress(current: int, total: int, step_name: str):
+                """Update progress for requirement extraction."""
+                progress_pct = current / total
+                display_name = step_name.replace('_', ' ').title()
+                
+                progress_bar.progress(
+                    progress_pct,
+                    text=f"Extracting requirements... {display_name}..."
+                )
+                with status_text.container():
+                    st.caption(f"Step: {current}/{total} | {display_name}")
+                with progress_placeholder.container():
+                    st.metric("Progress", f"{current}/{total}")
+            
+            # Extract requirements using tender context from Step 3
             extractor = get_requirement_extractor()
-            requirements = extractor.extract_with_fallback(st.session_state.tender_doc)
+            
+            # Pass tender profile metadata for dynamic, context-aware extraction
+            profile = st.session_state.tender_profile
+            
+            requirements = extractor.extract_with_fallback(
+                tender_doc=st.session_state.tender_doc,
+                tender_type=profile.tender_type,
+                industry=profile.industry,
+                complexity=profile.complexity,
+                priority_areas=profile.priority_areas,
+                tender_no=st.session_state.tender_doc.tender_no,
+                use_llm=not use_fast_mode,  # Skip LLM if fast mode enabled
+                progress_callback=update_extraction_progress
+            )
+            
             st.session_state.requirements = requirements
-            st.success("✅ Requirements extracted successfully")
+            progress_bar.progress(1.0, text="✅ Requirements extracted successfully!")
+            with status_text.container():
+                st.success("✅ Requirements extracted successfully")
         
         except ModelConnectionError as e:
             st.error(f"❌ LLM Connection Error: {str(e)}\n\nPlease ensure Ollama is running.")
@@ -489,47 +612,102 @@ def render_step_3_extract_requirements():
     with st.expander("📋 Extracted Requirements", expanded=True):
         requirements = st.session_state.requirements
         
-        col1, col2 = st.columns(2)
+        # Create tabs for better organization
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "Fleet",
+            "Technical",
+            "Scope",
+            "Timeline",
+            "Budget & Compliance"
+        ])
         
-        with col1:
-            st.write("**Fleet Requirements:**")
-            st.json(requirements.fleet_requirements)
+        with tab1:
+            if requirements.fleet_requirements:
+                st.markdown("**Fleet Requirements:**")
+                for key, value in requirements.fleet_requirements.items():
+                    if value:
+                        st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+            else:
+                st.info("No fleet requirements extracted")
+        
+        with tab2:
+            if requirements.technical_specifications:
+                st.markdown("**Technical Specifications:**")
+                for key, value in requirements.technical_specifications.items():
+                    if value:
+                        st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+            else:
+                st.info("No technical specifications extracted")
+        
+        with tab3:
+            col1, col2 = st.columns(2)
+            with col1:
+                if requirements.scope_and_deliverables:
+                    st.markdown("**Scope & Deliverables:**")
+                    for key, value in requirements.scope_and_deliverables.items():
+                        if value:
+                            st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+                else:
+                    st.info("No scope information extracted")
             
-            st.write("**Technical Specifications:**")
-            st.json(requirements.technical_specifications)
+            with col2:
+                if requirements.evaluation_criteria:
+                    st.markdown("**Evaluation Criteria:**")
+                    if isinstance(requirements.evaluation_criteria, dict):
+                        for key, value in requirements.evaluation_criteria.items():
+                            if value:
+                                st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+                    else:
+                        st.write(requirements.evaluation_criteria)
         
-        with col2:
-            st.write("**Scope & Deliverables:**")
-            st.json(requirements.scope_and_deliverables)
+        with tab4:
+            if requirements.timeline_and_milestones:
+                st.markdown("**Timeline & Milestones:**")
+                for key, value in requirements.timeline_and_milestones.items():
+                    if value:
+                        st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+            else:
+                st.info("No timeline information extracted")
+        
+        with tab5:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Budget Constraints:**")
+                if requirements.budget_constraints:
+                    for key, value in requirements.budget_constraints.items():
+                        if value:
+                            st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+                else:
+                    st.info("No budget information extracted")
             
-            st.write("**Timeline & Milestones:**")
-            st.json(requirements.timeline_and_milestones)
-        
-        st.write("**Budget Constraints:**")
-        st.json(requirements.budget_constraints)
-        
-        st.write("**Compliance Requirements:**")
-        st.json(requirements.compliance_requirements)
+            with col2:
+                st.markdown("**Compliance Requirements:**")
+                if requirements.compliance_requirements:
+                    for key, value in requirements.compliance_requirements.items():
+                        if value:
+                            st.write(f"• **{key.replace('_', ' ').title()}:** {value}")
+                else:
+                    st.info("No compliance requirements extracted")
     
     st.info("ℹ️ Requirements have been extracted automatically. Click 'Next' to generate the proposal.")
     
     # Navigation
     col1, col2 = st.columns([1, 1])
     with col1:
-        if st.button("⬅️ Back", use_container_width=True, key="back_3"):
-            st.session_state.step = 2
+        if st.button("⬅️ Back", use_container_width=True, key="back_4"):
+            st.session_state.step = 3
             st.rerun()
     with col2:
-        if st.button("Next: Generate Proposal ➡️", use_container_width=True, key="next_3"):
-            st.session_state.step = 4
+        if st.button("Next: Generate Proposal ➡️", use_container_width=True, key="next_4"):
+            st.session_state.step = 5
             st.rerun()
 
 
 # ========================
-# Step 4: Generate Proposal (Dynamic)
+# Step 5: Generate Proposal (Dynamic)
 # ========================
 
-def render_step_4_generate_proposal():
+def render_step_5_generate_proposal():
     """Render proposal generation step using dynamic generator."""
     if (st.session_state.tender_doc is None or 
         st.session_state.org_data is None or 
@@ -543,43 +721,85 @@ def render_step_4_generate_proposal():
     if st.session_state.proposal_content is None:
         st.info("🔄 Generating proposal with dynamic structure...")
         
-        # Progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        # Progress tracking containers
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            status_text = st.empty()
+        with col2:
+            progress_placeholder = st.empty()
+        
+        progress_bar = st.progress(0, text="Initializing...")
         
         try:
             # Use enhanced dynamic proposal generator
             generator = EnhancedProposalGenerator()
             
             structure = st.session_state.proposal_structure
-            n_sections = len(structure.section_order)
+            total_sections = len(structure.section_order) + 1  # +1 for cover page
             
-            status_text.text(f"Generating proposal... (0/{n_sections})")
-            progress_bar.progress(0.1)
+            # Define progress callback
+            def update_progress(current: int, total: int, section_name: str):
+                """Update progress bar and status text for section generation."""
+                progress_pct = current / total
+                # Format section name for display
+                display_name = section_name.replace('_', ' ').title()
+                
+                progress_bar.progress(
+                    progress_pct,
+                    text=f"Generating {display_name}..."
+                )
+                with status_text.container():
+                    st.caption(f"Sections: {current}/{total} | Current: {display_name}")
+                with progress_placeholder.container():
+                    st.metric("Progress", f"{current}/{total}")
             
-            # Generate using designed structure
+            # Generate using designed structure - reuse cached profile and structure from Step 3
             dynamic_proposal = generator.generate_dynamic_proposal(
                 tender_doc=st.session_state.tender_doc,
-                tender_profile=st.session_state.tender_profile,
-                target_structure=structure,
                 org_data=st.session_state.org_data,
-                requirements=st.session_state.requirements
+                requirements=st.session_state.requirements,
+                proposal_structure=st.session_state.proposal_structure,
+                tender_profile=st.session_state.tender_profile,
+                budget_context=st.session_state.tender_doc.budget_info,
+                timeline_context=st.session_state.tender_doc.timeline,
+                evaluation_criteria=st.session_state.requirements.evaluation_criteria.get('weighted_criteria', []) if st.session_state.requirements.evaluation_criteria else [],
+                compliance_context=st.session_state.requirements.compliance_requirements if st.session_state.requirements else None,
+                progress_callback=update_progress
             )
             
             st.session_state.proposal_content = dynamic_proposal
-            progress_bar.progress(1.0)
-            status_text.text("✅ Proposal generated successfully!")
+            progress_bar.progress(1.0, text="✅ Proposal generated successfully!")
+            with status_text.container():
+                st.success(f"✅ All {total_sections} sections generated successfully!")
             
         except Exception as e:
+            import traceback
             st.error(f"❌ Generation Error: {str(e)}")
             logger.error(f"Proposal generation error: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             st.stop()
     
     # Display generated dynamic proposal
+    if st.session_state.proposal_content is None:
+        st.warning("No proposal generated yet")
+        return
+    
     proposal = st.session_state.proposal_content
     
+    # Verify proposal has required attributes
+    if not hasattr(proposal, 'sections') or not hasattr(proposal, 'design'):
+        st.error("❌ Proposal object is malformed or incomplete")
+        logger.error(f"Proposal object missing attributes. Has sections: {hasattr(proposal, 'sections')}, Has design: {hasattr(proposal, 'design')}")
+        return
+    
     with st.expander("📄 Generated Dynamic Proposal", expanded=True):
-        # Create tabs dynamically based on sections
+        # Display cover page first if present
+        if 'cover_page' in proposal.sections:
+            st.subheader("📋 Cover Page")
+            st.text(proposal.sections['cover_page'])
+            st.divider()
+        
+        # Create tabs dynamically based on design sections (excluding cover_page)
         section_names = proposal.design.section_order
         
         # Create tabs for each section
@@ -612,12 +832,12 @@ def render_step_4_generate_proposal():
     # Navigation
     col1, col2 = st.columns([1, 1])
     with col1:
-        if st.button("⬅️ Back", use_container_width=True, key="back_4"):
-            st.session_state.step = 3
+        if st.button("⬅️ Back", use_container_width=True, key="back_5"):
+            st.session_state.step = 4
             st.rerun()
     with col2:
-        if st.button("Next: Refine & Export ➡️", use_container_width=True, key="next_4"):
-            st.session_state.step = 5
+        if st.button("Next: Refine & Export ➡️", use_container_width=True, key="next_5"):
+            st.session_state.step = 6
             st.rerun()
 
 
@@ -684,65 +904,150 @@ def render_step_5_refine_export():
     st.write("---")
     st.subheader("📥 Export Proposal")
     
+    # Export format selection
+    st.write("Choose how you'd like to export your proposal:")
+    
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        export_branded = st.checkbox("✨ Branded Proposal", value=True, help="Professional document with Safaricom branding")
+    with col2:
+        export_filled = st.checkbox(
+            "📋 Filled Tender", 
+            value=bool(st.session_state.tender_file_path),
+            disabled=not st.session_state.tender_file_path,
+            help="Original tender with proposal content filled into form fields (requires uploaded tender)"
+        )
+    with col3:
+        export_zip = st.checkbox(
+            "📦 Both (ZIP)", 
+            value=False,
+            disabled=not (st.session_state.tender_file_path and export_branded and export_filled),
+            help="Download both formats in a ZIP archive"
+        )
+    
+    st.write("---")
+    
     col1, col2 = st.columns([2, 1])
     
     with col1:
         filename = st.text_input(
-            "Filename (without .docx)",
+            "Filename (without extension)",
             value=f"Proposal_{st.session_state.org_data.get('name', 'Safaricom').replace(' ', '_')}"
         )
     
     with col2:
         st.write("")  # Spacing
         st.write("")
-        if st.button("📥 Download .docx", use_container_width=True, type="primary"):
-            try:
-                st.info("🔄 Generating Word document...")
+        if st.button("📥 Generate & Download", use_container_width=True, type="primary"):
+            if not (export_branded or export_filled):
+                st.warning("⚠️ Please select at least one export format")
+            else:
+                try:
+                    st.info("🔄 Generating documents...")
+                    
+                    exporter = get_document_exporter()
+                    
+                    # Convert dynamic proposal to export format
+                    export_data = {
+                        'title': st.session_state.tender_doc.title,
+                        'organization': st.session_state.org_data.get('name', 'Safaricom'),
+                        'sections': proposal.sections,
+                        'section_order': proposal.design.section_order,
+                        'design_rationale': proposal.design_rationale,
+                        'success_factors': proposal.success_factors
+                    }
+                    
+                    # Generate ZIP if both formats requested
+                    if export_zip:
+                        st.info("📦 Creating ZIP archive with both formats...")
+                        
+                        zip_bytes = exporter.export_dual_as_zip(
+                            proposal_content=export_data,
+                            org_data=st.session_state.org_data,
+                            original_tender_path=st.session_state.tender_file_path,
+                            tender_title=st.session_state.tender_doc.title
+                        )
+                        
+                        # Save to database
+                        db_service = get_db_service()
+                        proposal_id = db_service.insert_proposal(
+                            tender_id=st.session_state.tender_id,
+                            proposal_version="v1_dynamic_dual_export",
+                            content=export_data,
+                            org_data=st.session_state.org_data,
+                            status="final"
+                        )
+                        
+                        st.success("✅ ZIP archive generated successfully!")
+                        
+                        # Download button
+                        st.download_button(
+                            label="⬇️ Download ZIP (Branded + Filled Tender)",
+                            data=zip_bytes,
+                            file_name=f"{filename}_Dual_Export.zip",
+                            mime="application/zip",
+                            use_container_width=True
+                        )
+                    
+                    else:
+                        # Generate individual formats
+                        if export_branded:
+                            st.info("✨ Generating branded proposal...")
+                            
+                            docx_bytes = exporter.export_to_docx(
+                                proposal_content=export_data,
+                                org_data=st.session_state.org_data,
+                                tender_title=st.session_state.tender_doc.title
+                            )
+                            
+                            st.success("✅ Branded proposal generated!")
+                            
+                            st.download_button(
+                                label="⬇️ Download Branded Proposal",
+                                data=docx_bytes,
+                                file_name=f"{filename}_Branded.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                use_container_width=True
+                            )
+                        
+                        if export_filled:
+                            st.info("📋 Generating filled tender...")
+                            
+                            filled_bytes = exporter.export_as_filled_tender(
+                                original_tender_path=st.session_state.tender_file_path,
+                                proposal_content=export_data,
+                                org_data=st.session_state.org_data
+                            )
+                            
+                            st.success("✅ Filled tender generated!")
+                            
+                            st.download_button(
+                                label="⬇️ Download Filled Tender",
+                                data=filled_bytes,
+                                file_name=f"{filename}_Filled_Tender.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                use_container_width=True
+                            )
+                        
+                        # Save to database
+                        db_service = get_db_service()
+                        export_version = "v1_dynamic_branded" if export_branded and not export_filled else "v1_dynamic_filled" if export_filled and not export_branded else "v1_dynamic_both"
+                        proposal_id = db_service.insert_proposal(
+                            tender_id=st.session_state.tender_id,
+                            proposal_version=export_version,
+                            content=export_data,
+                            org_data=st.session_state.org_data,
+                            status="final"
+                        )
+                        
+                        st.success("✅ Export completed successfully!")
                 
-                exporter = get_document_exporter()
-                
-                # Convert dynamic proposal to export format
-                export_data = {
-                    'title': st.session_state.tender_doc.title,
-                    'organization': st.session_state.org_data.get('name', 'Safaricom'),
-                    'sections': proposal.sections,
-                    'section_order': proposal.design.section_order,
-                    'design_rationale': proposal.design_rationale,
-                    'success_factors': proposal.success_factors
-                }
-                
-                docx_bytes = exporter.export_to_docx(
-                    proposal_content=export_data,
-                    org_data=st.session_state.org_data,
-                    tender_title=st.session_state.tender_doc.title
-                )
-                
-                # Save to database
-                db_service = get_db_service()
-                proposal_id = db_service.insert_proposal(
-                    tender_id=st.session_state.tender_id,
-                    proposal_version="v1_dynamic",
-                    content=export_data,
-                    org_data=st.session_state.org_data,
-                    status="final"
-                )
-                
-                st.success("✅ Document generated successfully!")
-                
-                # Download button
-                st.download_button(
-                    label="⬇️ Click to Download Proposal",
-                    data=docx_bytes,
-                    file_name=f"{filename}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True
-                )
-            
-            except DocumentExportError as e:
-                st.error(f"❌ Export Error: {str(e)}")
-            except Exception as e:
-                st.error(f"❌ Failed to generate document: {str(e)}")
-                logger.error(f"Export error: {str(e)}")
+                except DocumentExportError as e:
+                    st.error(f"❌ Export Error: {str(e)}")
+                except Exception as e:
+                    st.error(f"❌ Failed to generate documents: {str(e)}")
+                    logger.error(f"Export error: {str(e)}")
     
     # Navigation
     col1, col2, col3 = st.columns([1, 1, 1])
@@ -775,18 +1080,18 @@ def render_sidebar():
             st.metric("Model", "Ready ✅" if st.session_state.model_initialized else "Not Ready")
         
         with col2:
-            st.metric("Step", f"{st.session_state.step}/5")
+            st.metric("Step", f"{st.session_state.step}/6")
         
         st.write("---")
         st.subheader("📚 Help")
         st.write("""
-**ENHANCED Workflow:**
-1. Upload tender (PDF, text, or form)
-2. Enter organization details
-2.5. AI designs optimal proposal structure (NEW!)
-3. Auto-extract requirements
-4. Generate dynamic proposal with custom sections
-5. Refine & download
+**Sequential Workflow:**
+1️⃣ Upload tender (PDF, text, or form)
+2️⃣ Enter organization details
+3️⃣ AI designs optimal proposal structure
+4️⃣ Auto-extract requirements (LLM-based)
+5️⃣ Generate dynamic proposal with custom sections
+6️⃣ Refine & download as .docx
 
 **What's New:**
 ✨ Dynamic proposal structures based on tender type
@@ -833,14 +1138,14 @@ def render():
         render_step_1_tender_input()
     elif st.session_state.step == 2:
         render_step_2_organization_info()
-    elif st.session_state.step == 2.5:
-        render_step_25_structure_design()
     elif st.session_state.step == 3:
-        render_step_3_extract_requirements()
+        render_step_3_structure_design()
     elif st.session_state.step == 4:
-        render_step_4_generate_proposal()
+        render_step_4_extract_requirements()
     elif st.session_state.step == 5:
-        render_step_5_refine_export()
+        render_step_5_generate_proposal()
+    elif st.session_state.step == 6:
+        render_step_6_refine_export()
 
 
 if __name__ == "__main__":

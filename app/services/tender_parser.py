@@ -45,6 +45,12 @@ try:
 except ImportError:
     PYTESSERACT_AVAILABLE = False
 
+try:
+    from docx import Document
+    PYTHON_DOCX_AVAILABLE = True
+except ImportError:
+    PYTHON_DOCX_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +75,11 @@ class TenderDocument:
         fleet_details: Fleet/equipment requirements
         timeline: Project timeline/deadline
         budget_info: Budget/pricing constraints
+        tender_no: Tender reference number
+        address: Tender issuer address
+        email: Tender issuer email
+        phone_number: Tender issuer phone number
+        bid_validity: Bid validity period
         metadata: Additional metadata from parsing
     """
     source_type: TenderSourceType
@@ -79,6 +90,11 @@ class TenderDocument:
     fleet_details: Dict[str, Any] = field(default_factory=dict)
     timeline: Optional[str] = None
     budget_info: Optional[str] = None
+    tender_no: Optional[str] = None
+    address: Optional[str] = None
+    email: Optional[str] = None
+    phone_number: Optional[str] = None
+    bid_validity: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -92,6 +108,10 @@ class TenderDocument:
             'fleet_details': self.fleet_details,
             'timeline': self.timeline,
             'budget_info': self.budget_info,
+            'tender_no': self.tender_no,
+            'address': self.address,
+            'email': self.email,
+            'bid_validity': self.bid_validity,
             'metadata': self.metadata
         }
 
@@ -209,7 +229,7 @@ class BaseTenderParser(ABC):
 
     @staticmethod
     def _extract_timeline(text: str) -> Optional[str]:
-        """Extract timeline/deadline information - conservative approach."""
+        """Extract timeline/deadline information including time components."""
         # Look for lines with specific date/time indicators
         lines = text.split('\n')
         
@@ -233,11 +253,22 @@ class BaseTenderParser(ABC):
             ]) or any(char.isdigit() for char in line[-20:])
             
             if has_date_indicator:
-                # Extract just the meaningful part, remove dots and page numbers
+                # Start with the current line
                 result = line.strip()
+                
+                # If time is not in current line, check next line for time patterns
+                if not re.search(r'at\s+\d{1,2}:\d{2}', result, re.IGNORECASE):
+                    # Check next line for time information
+                    if i + 1 < len(lines):
+                        next_line = lines[i + 1].strip()
+                        # If next line contains time, append it
+                        if re.search(r'\d{1,2}:\d{2}\s*(?:a\.?m|p\.?m|am|pm|hours)', next_line, re.IGNORECASE):
+                            result = result + ' ' + next_line
+                
+                # Clean up dots and page numbers
                 result = re.sub(r'\s*\.+\s*\d+\s*', '', result)  # Remove "........ 10"
-                result = re.sub(r'(.{5,150})[\s.]*$', r'\1', result)  # Trim to reasonable length
-                if 10 < len(result) < 250:
+                result = re.sub(r'(.{5,300})[\s.]*$', r'\1', result)  # Trim to reasonable length (increased from 150)
+                if 10 < len(result) < 350:
                     return result
         
         return None
@@ -271,6 +302,171 @@ class BaseTenderParser(ABC):
                 result = re.sub(r'\s+', ' ', result)
                 if 10 < len(result) < 250:
                     return result
+        
+        return None
+
+    @staticmethod
+    def _extract_tender_no(text: str) -> Optional[str]:
+        """Extract tender/reference number - handles various formats."""
+        lines = text.split('\n')
+        
+        for line in lines[:80]:  # Increased search range
+            line_lower = line.lower()
+            line_normalized = re.sub(r'\.', '', line_lower)
+            
+            # Pattern 1: Explicit keyword-based extraction (e.g., "TENDER NO. KRA/HQS/DP-016/2025-2026")
+            if any(keyword in line_normalized for keyword in ['tender no', 'ref no', 'reference', 'tender ref', 'bid no', 'tender number']):
+                # Try multiple regex patterns to capture the number
+                patterns = [
+                    r'(?:tender\s+no\.?|ref\s+no\.?|reference|tender\s+ref|bid\s+no\.?|tender\s+number)\s*[:=]?\s*([A-Z0-9\-/\.]+)',  # Explicit keyword
+                    r'(?:tender\s+no\.?|ref\s+no\.?)\s*[:=]?\s*([A-Z0-9\-/\.]+)',  # Simplified
+                ]
+                
+                for pattern in patterns:
+                    match = re.search(pattern, line, re.IGNORECASE)
+                    if match:
+                        result = match.group(1).strip().rstrip('.')
+                        if len(result) > 3:  # Ensure it's a meaningful tender number
+                            return result
+            
+            # Pattern 2: Fallback - look for tender/reference patterns even without explicit keyword
+            # Matches: KRA/HQS/DP-016/2025-2026 or similar patterns
+            if any(keyword in line_normalized for keyword in ['kra', 'tenderno', 'ref', 'tenderid', 'tender id']):
+                # Look for alphanumeric with slashes/dashes pattern (common in tender numbers)
+                match = re.search(r'\b([A-Z][A-Z0-9]*(?:[/-][A-Z0-9]+){2,})\b', line)
+                if match:
+                    result = match.group(1).strip()
+                    if len(result) > 5:  # Ensure meaningful length
+                        return result
+        
+        return None
+
+    @staticmethod
+    def _extract_address(text: str) -> Optional[str]:
+        """Extract tender issuer address."""
+        lines = text.split('\n')
+        
+        # First, try to find address by keywords
+        for i, line in enumerate(lines[:80]):
+            line_lower = line.lower()
+            
+            # Normalize dots for keyword detection (P.O. BOX -> pobox)
+            line_normalized = re.sub(r'\.', '', line_lower)
+            
+            # Look for address keywords
+            if any(keyword in line_normalized for keyword in ['address', 'location', 'pobox', 'office', 'headquarters', 'times tower']):
+                # Get this line and potentially combine with next 2-3 lines if they look like address continuation
+                result_lines = [line.strip()]
+                
+                for j in range(i+1, min(i+4, len(lines))):
+                    next_line = lines[j].strip()
+                    # Stop if we hit a keyword line or metadata
+                    if (next_line and not next_line[0].isdigit() and 
+                        not any(kw in next_line.lower() for kw in ['tender', 'email', 'phone', 'date', 'closing'])):
+                        result_lines.append(next_line)
+                    else:
+                        break
+                
+                result = '\n'.join(result_lines)
+                if len(result) > 10:
+                    return result.strip()
+        
+        # Fallback: Look for address between tender number and email
+        email_match = None
+        email_line_idx = -1
+        tender_line_idx = -1
+        
+        for i, line in enumerate(lines[:100]):
+            line_lower = line.lower()
+            if '@' in line and 'email' in line_lower.lower():
+                email_line_idx = i
+                break
+            if re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}', line):
+                email_line_idx = i
+                break
+        
+        for i, line in enumerate(lines[:50]):
+            if 'tender' in line.lower() and 'no' in line.lower():
+                tender_line_idx = i
+                break
+        
+        # If we found both tender and email positions, extract lines between them as address
+        if tender_line_idx >= 0 and email_line_idx > tender_line_idx:
+            address_lines = []
+            for i in range(tender_line_idx + 1, email_line_idx):
+                line = lines[i].strip()
+                if line and not any(keyword in line.lower() for keyword in ['closing', 'date']):
+                    address_lines.append(line)
+            
+            if address_lines:
+                result = '\n'.join(address_lines)
+                if len(result) > 10:
+                    return result.strip()
+        
+        return None
+
+
+    @staticmethod
+    def _extract_email(text: str) -> Optional[str]:
+        """Extract contact email addresses."""
+        # Look for email pattern
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        matches = re.findall(email_pattern, text[:4000])  # Search first 4000 chars
+        
+        if matches:
+            # Return first email, or combine multiple if found
+            return matches[0]
+        
+        # Fallback: look for "email:" followed by text
+        lines = text.split('\n')
+        for line in lines[:60]:
+            if 'email' in line.lower():
+                # Extract after "email:" or "email ="
+                match = re.search(r'email[:\s=]+(.+?)(?:\n|$)', line, re.IGNORECASE)
+                if match:
+                    email_text = match.group(1).strip()
+                    if email_text:
+                        return email_text
+        
+        return None
+
+    @staticmethod
+    def _extract_bid_validity(text: str) -> Optional[str]:
+        """Extract bid validity period."""
+        lines = text.split('\n')
+        
+        for line in lines[:100]:
+            line_lower = line.lower()
+            
+            # Look for bid validity keywords
+            if any(keyword in line_lower for keyword in ['bid validity', 'validity period', 'bid valid', 'valid for', 'offer validity']):
+                result = line.strip()
+                # Remove excessive dots and formatting
+                result = re.sub(r'\.{3,}', '', result)
+                result = re.sub(r'\s+', ' ', result)
+                if 10 < len(result) < 200:
+                    return result
+        
+        return None
+
+    @staticmethod
+    def _extract_phone_number(text: str) -> Optional[str]:
+        """Extract phone number(s) from tender document."""
+        # Phone number patterns
+        phone_patterns = [
+            r'(?:TEL|PHONE|CONTACT)[:\s]+(\+?\d[\d\s\-\(\)]+\d)',  # TEL: +254 02 281 7022
+            r'(?:TEL|PHONE)[:\s=]+([+\d\s\-\(\)]+)',  # With more flexible spacing
+            r'\+254[\d\s\-\(\)]+\d',  # Kenya direct: +254...
+            r'0[1-9][\d\s\-]{5,}',  # Local Kenya: 02 281 7022
+        ]
+        
+        for pattern in phone_patterns:
+            match = re.search(pattern, text[:3000], re.IGNORECASE)
+            if match:
+                phone = match.group(1) if match.groups() else match.group(0)
+                phone = phone.strip()
+                if phone and len(phone) > 5:
+                    return phone
         
         return None
 
@@ -420,6 +616,11 @@ class PDFTenderParser(BaseTenderParser):
                 fleet_details=self._extract_fleet_details(full_text),
                 timeline=self._extract_timeline(full_text),
                 budget_info=self._extract_budget(full_text),
+                tender_no=self._extract_tender_no(full_text),
+                address=self._extract_address(full_text),
+                email=self._extract_email(full_text),
+                phone_number=self._extract_phone_number(full_text),
+                bid_validity=self._extract_bid_validity(full_text),
                 metadata={
                     'page_count': page_count,
                     'extraction_methods': extraction_methods
@@ -527,43 +728,60 @@ class PDFTenderParser(BaseTenderParser):
 
     @staticmethod
     def _extract_title_from_text(text: str) -> str:
-        """Extract tender title from text - robust extraction."""
-        lines = text.split('\n')
+        """Extract tender title from text - handles multi-line titles."""
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
         
-        # Strategy 1: Look for all-caps lines first (titles are often all caps)
-        for line in lines[:20]:
-            line = line.strip()
+        # Strategy 1: Look for all-caps lines, but check if they're complete
+        for idx, line in enumerate(lines[:20]):
             if (len(line) > 15 and len(line) < 300 and
                 line.isupper() and 
                 not all(c in '.-=_#*' for c in line) and
                 line.count(' ') >= 2):
-                return line
+                
+                # Check if this line looks incomplete (ends with incomplete word/phrase)
+                incomplete_endings = (' FOR', ' OF', ' AND', ' WITH', ' TO', ' THE', ' A', ' AN', 'FOR A')
+                
+                if line.endswith(incomplete_endings) and idx + 1 < len(lines):
+                    next_line = lines[idx + 1].strip()
+                    # If next line is also all-caps and not a reference number, join them
+                    if (next_line and next_line.isupper() and 
+                        not next_line.startswith(('REF', 'TENDER', 'NO.', 'RFQ', 'RFP')) and
+                        len(line) + len(next_line) < 350):
+                        combined = f"{line} {next_line}"
+                        # Stop if we hit a line that looks like metadata
+                        if not combined.endswith((':', 'YEARS', 'MONTHS', 'DAYS')):
+                            return combined
+                        # If it ends with YEARS/valid ending, return it
+                        if combined.endswith(('YEARS', 'MONTHS', 'DAYS', ')', 'SERVICES', 'PRODUCTS')):
+                            return combined
+                
+                # Line looks complete on its own
+                if not line.endswith(incomplete_endings):
+                    return line
         
-        # Strategy 2: First meaningful line that looks like a title
-        best_title = ""
-        for line in lines[:15]:
-            line = line.strip()
-            if (20 <= len(line) <= 300 and 
-                line.count(' ') >= 2 and
+        # Strategy 2: Join first 2-3 meaningful lines if they form a compound title
+        candidate_lines = []
+        for line in lines[:10]:
+            if (20 <= len(line) <= 200 and 
+                line.count(' ') >= 1 and
                 not line.endswith(':') and
                 not line.startswith('---') and
-                not any(c in line for c in ['[', ']', '()', '{}', 'http', 'email'])):
-                if len(line) > len(best_title):
-                    best_title = line
+                not any(c in line for c in ['[', ']', '()']) and
+                not any(x in line for x in ['TENDER', 'KRA/', 'TEL:', 'EMAIL:', 'P.O.'])):
+                candidate_lines.append(line)
+            if len(candidate_lines) >= 2:
+                break
         
-        if best_title and len(best_title) > 15:
-            return best_title
-        
-        # Strategy 3: Join first 2 lines if they form a complete title
-        first_lines = [l.strip() for l in lines[:5] if l.strip() and len(l.strip()) > 5]
-        if len(first_lines) >= 2:
-            combined = " ".join(first_lines[:2])
+        if len(candidate_lines) >= 2:
+            combined = " ".join(candidate_lines[:2])
             if 20 < len(combined) < 350:
                 return combined
         
-        # Fallback
+        if candidate_lines and len(candidate_lines[0]) > 15:
+            return candidate_lines[0]
+        
+        # Fallback: first substantial line
         for line in lines:
-            line = line.strip()
             if 15 <= len(line) <= 300:
                 return line
         
@@ -611,6 +829,11 @@ class TextTenderParser(BaseTenderParser):
             fleet_details=self._extract_fleet_details(self.text_content),
             timeline=self._extract_timeline(self.text_content),
             budget_info=self._extract_budget(self.text_content),
+            tender_no=self._extract_tender_no(self.text_content),
+            address=self._extract_address(self.text_content),
+            email=self._extract_email(self.text_content),
+            phone_number=self._extract_phone_number(self.text_content),
+            bid_validity=self._extract_bid_validity(self.text_content),
             metadata={'input_lines': len(self.text_content.split('\n'))}
         )
 
@@ -723,6 +946,11 @@ class FormTenderParser(BaseTenderParser):
             fleet_details=fleet,
             timeline=self.form_data.get('timeline'),
             budget_info=self.form_data.get('budget'),
+            tender_no=self.form_data.get('tender_no'),
+            address=self.form_data.get('address'),
+            email=self.form_data.get('email'),
+            phone_number=self.form_data.get('phone_number'),
+            bid_validity=self.form_data.get('bid_validity'),
             metadata={'form_fields': list(self.form_data.keys())}
         )
 
@@ -916,7 +1144,7 @@ class TenderParserFactory:
     def parse_text(text_content: str, title: Optional[str] = None) -> TenderDocument:
         """
         Parse text tender (email or plain text) using regex (fast parsing for Step 1).
-        LLM parsing deferred to Step 2.5 (structure design).
+        LLM parsing deferred to Step 3 (structure design).
         
         Args:
             text_content: Tender content as text
@@ -947,7 +1175,7 @@ class TenderParserFactory:
     def parse_form(form_data: Dict[str, Any]) -> TenderDocument:
         """
         Parse form-submitted tender using regex (fast parsing for Step 1).
-        LLM parsing deferred to Step 2.5 (structure design).
+        LLM parsing deferred to Step 3 (structure design).
         
         Args:
             form_data: Dictionary with tender form data
@@ -969,6 +1197,134 @@ class TenderParserFactory:
         except Exception as e:
             logger.error(f"Form parsing failed: {str(e)}")
             raise TenderParsingError(f"Failed to parse form: {str(e)}")
+
+    @staticmethod
+    def parse_docx(file_bytes: bytes) -> TenderDocument:
+        """
+        Parse DOCX tender document.
+        Extracts text from all paragraphs and tables in the DOCX file.
+        
+        Args:
+            file_bytes: DOCX file content as bytes
+            
+        Returns:
+            TenderDocument: Parsed tender
+            
+        Raises:
+            TenderParsingError: If parsing fails
+        """
+        try:
+            if not PYTHON_DOCX_AVAILABLE:
+                raise TenderParsingError("python-docx is not installed. Please install it using: pip install python-docx")
+            
+            logger.info("Parsing DOCX document...")
+            
+            # Load the DOCX file from bytes
+            docx_file = io.BytesIO(file_bytes)
+            doc = Document(docx_file)
+            
+            # Extract all text from paragraphs
+            text_content = []
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    text_content.append(paragraph.text)
+            
+            # Extract text from tables
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = []
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            row_text.append(cell.text)
+                    if row_text:
+                        text_content.append(' | '.join(row_text))
+            
+            # Combine all text
+            full_text = '\n'.join(text_content)
+            
+            if not full_text.strip():
+                raise TenderParsingError("No text content found in DOCX file")
+            
+            # Use text parser on extracted content
+            return TenderParserFactory.parse_text(full_text, title=None)
+        
+        except TenderParsingError:
+            raise
+        except Exception as e:
+            logger.error(f"DOCX parsing failed: {str(e)}")
+            raise TenderParsingError(f"Failed to parse DOCX: {str(e)}")
+
+    @staticmethod
+    def parse_txt(file_bytes: bytes) -> TenderDocument:
+        """
+        Parse TXT tender document.
+        Decodes the text file and processes it like text input.
+        
+        Args:
+            file_bytes: TXT file content as bytes
+            
+        Returns:
+            TenderDocument: Parsed tender
+            
+        Raises:
+            TenderParsingError: If parsing fails
+        """
+        try:
+            logger.info("Parsing TXT document...")
+            
+            # Try multiple encodings
+            text_content = None
+            for encoding in ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']:
+                try:
+                    text_content = file_bytes.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            
+            if text_content is None:
+                raise TenderParsingError("Could not decode TXT file with any supported encoding")
+            
+            if not text_content.strip():
+                raise TenderParsingError("TXT file is empty")
+            
+            # Use text parser on the content
+            return TenderParserFactory.parse_text(text_content, title=None)
+        
+        except TenderParsingError:
+            raise
+        except Exception as e:
+            logger.error(f"TXT parsing failed: {str(e)}")
+            raise TenderParsingError(f"Failed to parse TXT: {str(e)}")
+
+    @staticmethod
+    def parse_file(file_bytes: bytes, filename: str) -> TenderDocument:
+        """
+        Parse a file based on its extension.
+        Automatically detects the file type and uses the appropriate parser.
+        
+        Args:
+            file_bytes: File content as bytes
+            filename: Original filename (used to detect file type)
+            
+        Returns:
+            TenderDocument: Parsed tender
+            
+        Raises:
+            TenderParsingError: If file type is not supported
+        """
+        # Get file extension
+        file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
+        
+        logger.info(f"Detecting file type from extension: .{file_ext}")
+        
+        if file_ext == 'pdf':
+            return TenderParserFactory.parse_pdf(file_bytes)
+        elif file_ext == 'docx' or file_ext == 'doc':
+            return TenderParserFactory.parse_docx(file_bytes)
+        elif file_ext == 'txt':
+            return TenderParserFactory.parse_txt(file_bytes)
+        else:
+            raise TenderParsingError(f"Unsupported file type: .{file_ext}. Supported types: PDF, DOCX, TXT")
 
     @staticmethod
     def _form_to_text(form_data: Dict[str, Any]) -> str:

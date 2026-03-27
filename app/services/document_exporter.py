@@ -2,13 +2,15 @@
 Document Exporter Service
 Converts proposal content to professionally formatted .docx files.
 Includes Safaricom branding, styling, and structure.
+Also supports filling tender templates with proposal content.
 """
 
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from zipfile import ZipFile
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,11 @@ class DocumentExporter:
             raise DocumentExportError(
                 "python-docx not available. Install: pip install python-docx"
             )
-        logger.info("DocumentExporter initialized")
+        # Set branding paths
+        branding_dir = Path(__file__).parent.parent.parent / "data" / "branding"
+        self.logo_path = branding_dir / "LOGO.jpg"
+        self.details_path = branding_dir / "DETAILS.jpg"
+        logger.info("DocumentExporter initialized with branding assets")
 
     def export_to_docx(
         self,
@@ -153,6 +159,142 @@ class DocumentExporter:
             logger.error(f"File export failed: {str(e)}")
             raise DocumentExportError(f"Failed to save file: {str(e)}")
 
+    def export_as_filled_tender(
+        self,
+        original_tender_path: str,
+        proposal_content: Dict[str, str],
+        org_data: Dict[str, Any]
+    ) -> bytes:
+        """
+        Export proposal as filled tender template (preserving original structure).
+        
+        Args:
+            original_tender_path: Path to original tender document
+            proposal_content: Dictionary with proposal sections
+            org_data: Organization information
+        
+        Returns:
+            bytes: Filled tender document content
+            
+        Raises:
+            DocumentExportError: If filling fails
+        """
+        try:
+            from .form_detector import FormDetector
+            from .form_filler import FormFiller
+
+            # Detect form structure in original tender
+            detector = FormDetector()
+            form_structure = detector.detect_form_structure(original_tender_path)
+
+            # Fill the form with proposal content
+            filler = FormFiller()
+            filled_docx = filler.fill_form(
+                original_tender_path,
+                form_structure,
+                proposal_content,
+                org_data
+            )
+
+            logger.info("Filled tender exported successfully")
+            return filled_docx
+
+        except Exception as e:
+            logger.error(f"Tender filling failed: {str(e)}")
+            raise DocumentExportError(f"Failed to fill tender: {str(e)}")
+
+    def export_dual(
+        self,
+        proposal_content: Dict[str, str],
+        org_data: Dict[str, Any],
+        original_tender_path: Optional[str] = None,
+        tender_title: str = "Proposal Document"
+    ) -> Tuple[bytes, Optional[bytes]]:
+        """
+        Export both branded proposal and filled tender (if original provided).
+        
+        Args:
+            proposal_content: Dictionary with proposal sections
+            org_data: Organization information
+            original_tender_path: Path to original tender (optional)
+            tender_title: Title of the proposal
+        
+        Returns:
+            Tuple[bytes, Optional[bytes]]: (branded_docx, filled_tender_docx or None)
+        """
+        try:
+            # Always generate branded proposal
+            branded = self.export_to_docx(proposal_content, org_data, tender_title)
+
+            # Optionally fill original tender if provided
+            filled_tender = None
+            if original_tender_path and Path(original_tender_path).exists():
+                try:
+                    filled_tender = self.export_as_filled_tender(
+                        original_tender_path,
+                        proposal_content,
+                        org_data
+                    )
+                    logger.info("Both branded and filled tender generated")
+                except Exception as e:
+                    logger.warning(f"Could not generate filled tender: {e}. Returning branded only.")
+
+            return (branded, filled_tender)
+
+        except Exception as e:
+            logger.error(f"Dual export failed: {str(e)}")
+            raise DocumentExportError(f"Failed to export documents: {str(e)}")
+
+    def export_dual_as_zip(
+        self,
+        proposal_content: Dict[str, str],
+        org_data: Dict[str, Any],
+        original_tender_path: Optional[str] = None,
+        tender_title: str = "Proposal Document"
+    ) -> bytes:
+        """
+        Export both branded and filled tender as a ZIP archive.
+        
+        Args:
+            proposal_content: Dictionary with proposal sections
+            org_data: Organization information
+            original_tender_path: Path to original tender (optional)
+            tender_title: Title of the proposal
+        
+        Returns:
+            bytes: ZIP file content containing both documents
+        """
+        try:
+            branded, filled_tender = self.export_dual(
+                proposal_content,
+                org_data,
+                original_tender_path,
+                tender_title
+            )
+
+            # Create ZIP archive
+            zip_buffer = BytesIO()
+            with ZipFile(zip_buffer, 'w') as zip_file:
+                # Add branded proposal
+                org_safe = "".join(c if c.isalnum() or c == " " else "" for c in org_data.get('name', 'Org'))[:20].replace(" ", "_")
+                tender_safe = "".join(c if c.isalnum() or c == " " else "" for c in tender_title)[:20].replace(" ", "_")
+                
+                branded_filename = f"Proposal_Branded_{org_safe}_{tender_safe}.docx"
+                zip_file.writestr(branded_filename, branded)
+
+                # Add filled tender if available
+                if filled_tender:
+                    filled_filename = f"Proposal_Filled_Tender_{org_safe}_{tender_safe}.docx"
+                    zip_file.writestr(filled_filename, filled_tender)
+
+            zip_buffer.seek(0)
+            logger.info("Dual export as ZIP completed")
+            return zip_buffer.getvalue()
+
+        except Exception as e:
+            logger.error(f"ZIP export failed: {str(e)}")
+            raise DocumentExportError(f"Failed to create ZIP export: {str(e)}")
+
     # ========================
     # Document Building Methods
     # ========================
@@ -163,7 +305,20 @@ class DocumentExporter:
         org_data: Dict[str, Any],
         tender_title: str
     ) -> None:
-        """Add title and header section."""
+        """Add title and header section with Safaricom branding."""
+        # Add logo if available
+        if self.logo_path.exists():
+            try:
+                logo_para = doc.add_paragraph()
+                logo_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                logo_run = logo_para.add_run()
+                logo_run.add_picture(str(self.logo_path), width=Inches(3))
+            except Exception as e:
+                logger.warning(f"Could not add logo: {e}")
+        
+        # Add spacing
+        doc.add_paragraph()
+        
         # Title
         title = doc.add_paragraph()
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -249,15 +404,22 @@ class DocumentExporter:
         doc: Document,
         proposal_content: Dict[str, str]
     ) -> None:
-        """Add proposal sections to document."""
+        """Add proposal sections to document with dynamic titles."""
         for key, content in proposal_content.items():
-            if key in self.SECTION_HEADINGS:
-                heading, level = self.SECTION_HEADINGS[key]
+            if content and content.strip():
+                # Generate heading from key (dynamic section headers)
+                if key in self.SECTION_HEADINGS:
+                    heading, level = self.SECTION_HEADINGS[key]
+                else:
+                    # Convert key to title case for dynamic sections
+                    heading = key.replace('_', ' ').title()
+                    level = 1
                 
-                # Add heading
+                # Add heading with Safaricom branding
                 heading_para = doc.add_heading(heading, level=level)
-                heading_run = heading_para.runs[0]
-                heading_run.font.color.rgb = self.BRAND_COLORS['primary']
+                if heading_para.runs:
+                    heading_run = heading_para.runs[0]
+                    heading_run.font.color.rgb = self.BRAND_COLORS['primary']
                 
                 # Add content
                 # Split content into paragraphs for better formatting
@@ -277,16 +439,42 @@ class DocumentExporter:
         doc: Document,
         org_data: Dict[str, Any]
     ) -> None:
-        """Add footer with organization information."""
-        # Add horizontal line
+        """Add footer with Safaricom branding details and contact information."""
+        # Add footer with details image if available
         section = doc.sections[0]
         footer = section.footer
-        footer_para = footer.paragraphs[0]
-        footer_para.text = f"{org_data.get('name', 'Safaricom')} | Confidential | {datetime.now().strftime('%Y-%m-%d')}"
-        footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        for run in footer_para.runs:
-            run.font.size = Pt(9)
-            run.font.color.rgb = RGBColor(128, 128, 128)
+        
+        # Add details image if available
+        if self.details_path.exists():
+            try:
+                # Clear default footer paragraphs
+                for para in footer.paragraphs:
+                    p = para._element
+                    p.getparent().remove(p)
+                
+                # Add new paragraph with image
+                footer_para = footer.add_paragraph()
+                footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                footer_run = footer_para.add_run()
+                footer_run.add_picture(str(self.details_path), width=Inches(6))
+                logger.info("Added Safaricom details image to footer")
+            except Exception as e:
+                logger.warning(f"Could not add footer image: {e}")
+                # Fallback to text footer
+                footer_para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+                footer_para.text = f"{org_data.get('name', 'Safaricom')} | Confidential | {datetime.now().strftime('%Y-%m-%d')}"
+                footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in footer_para.runs:
+                    run.font.size = Pt(9)
+                    run.font.color.rgb = RGBColor(128, 128, 128)
+        else:
+            # Fallback text footer if image not available
+            footer_para = footer.paragraphs[0]
+            footer_para.text = f"{org_data.get('name', 'Safaricom')} | Confidential | {datetime.now().strftime('%Y-%m-%d')}"
+            footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in footer_para.runs:
+                run.font.size = Pt(9)
+                run.font.color.rgb = RGBColor(128, 128, 128)
 
     @staticmethod
     def _shade_cell(cell, color):

@@ -8,6 +8,10 @@ import os
 import importlib.util
 import sys
 import traceback
+
+# Disable PaddleOCR model source check for faster startup
+os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
+
 from dotenv import load_dotenv
 from app.services.local_db_service import get_db_service
 
@@ -134,6 +138,46 @@ else:
     # Page header
     st.title("📄✨ Proposal Generator")
     st.markdown("Generate professional proposals from tenders using AI")
+    st.markdown("---")
+    
+    # Performance tips
+    with st.expander("⚡ **PERFORMANCE TIPS** - Make Steps 1-4 FASTER ⚡", expanded=False):
+        st.markdown("""
+        ### Why is it slow?
+        - **LLM Inference**: AI model generation takes time (60-180s depending on model)
+        - **Model Size**: Larger models (8B parameters) = slower but better quality
+        - **Hardware**: GPU/RAM affects speed significantly
+        
+        ### Speed Up Steps 1-4:
+        
+        **✅ RECOMMENDED (Fastest):**
+        - ⚡ **Use "Fast Mode" in Step 3** - Skips AI, uses pattern-based extraction (2-5 seconds)
+        - 🚀 Use **Mistral 7B** model instead of DeepSeek (3-4x faster)
+          - Install: `ollama pull mistral:7b`
+          - Or use: `ollama pull mistral:7b-q5_K_M` (quantized, even faster)
+        
+        **🟡 MODERATE SPEED:**
+        - Use "Detailed Mode" if you need AI analysis (60-120 seconds per step)
+        - Use **DeepSeek R1 8B** for better reasoning (slower: 120-180 seconds)
+        
+        **🔧 HARDWARE OPTIMIZATION:**
+        - Add GPU support (NVIDIA/AMD) in Ollama: https://ollama.ai
+        - Increase RAM (minimum 8GB, better with 16GB+)
+        - Close other applications while generating
+        
+        **💡 WORKFLOW TIPS:**
+        1. Start with **Fast Mode** (Step 3) for quick results
+        2. Review auto-extracted requirements
+        3. Switch to **Detailed Mode** only if you need AI refinement
+        4. Use pattern-based fallback (happens automatically if timeout occurs)
+        
+        **📊 EXPECTED TIMES:**
+        - Fast Mode (Step 3): 2-5s ⚡
+        - Mistral 7B (Step 3/4): 30-60s each 🟢
+        - DeepSeek R1 8B (Step 3/4): 120-180s each 🟡
+        - Local GPU: 5-15s per step ✨
+        """)
+    
     st.markdown("---")
 
 # Load and execute the proposal generator view

@@ -6,6 +6,8 @@ Enables learning from successful proposals to improve accuracy and competitivene
 
 import logging
 import json
+import hashlib
+from functools import lru_cache
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -16,6 +18,10 @@ from app.services.tender_parser import TenderDocument
 from app.ai_service.model_manager import get_model_manager
 from app.ai_service.rag_service import get_rag_service
 
+
+# ========================
+# Data Classes (Moved Before Functions)
+# ========================
 
 @dataclass
 class TenderProfile:
@@ -29,6 +35,31 @@ class TenderProfile:
     estimated_value: Optional[str] = None
 
 
+# ========================
+# Memoization Utilities
+# ========================
+
+@lru_cache(maxsize=128)
+def _get_content_hash_classification(content_hash: str) -> Optional[TenderProfile]:
+    """
+    Helper to cache classification results by content hash.
+    ✅ Uses lru_cache for deterministic results.
+    
+    Args:
+        content_hash: MD5 hash of tender content
+        
+    Returns:
+        Optional[TenderProfile]: Cached profile or None
+    """
+    # This is just a cache key holder; actual classification happens in classify()
+    return None
+
+
+def _hash_tender_content(content: str) -> str:
+    """Generate consistent hash for tender content."""
+    return hashlib.md5(content.encode()).hexdigest()
+
+
 @dataclass
 class ProposalSectionDef:
     """Definition of a proposal section."""
@@ -40,6 +71,7 @@ class ProposalSectionDef:
     is_custom: bool = False  # Whether this is a custom section
     reason: Optional[str] = None  # Why this section was recommended
     similar_past_examples: Optional[List[str]] = None  # References to past proposals
+    target_length: int = 400  # Target word count (derived from suggested_length or set dynamically)
 
 
 @dataclass
@@ -52,38 +84,92 @@ class DynamicProposalStructure:
     design_rationale: str  # Why this structure was chosen
     tender_profile: TenderProfile
     estimated_total_length: str  # e.g., "2500-3500 words"
+    
+    @property
+    def section_definitions(self) -> Dict[str, ProposalSectionDef]:
+        """Create dictionary mapping section names to definitions."""
+        section_dict = {}
+        for section in self.base_sections + self.custom_sections + self.optional_sections:
+            section_dict[section.name] = section
+        return section_dict
+    
+    @property
+    def estimated_word_count_min(self) -> int:
+        """Extract minimum word count from estimated_total_length."""
+        try:
+            parts = self.estimated_total_length.replace('words', '').replace('-', ',').split(',')
+            return int(parts[0].strip())
+        except (ValueError, IndexError):
+            return 2000
+    
+    @property
+    def estimated_word_count_max(self) -> int:
+        """Extract maximum word count from estimated_total_length."""
+        try:
+            parts = self.estimated_total_length.replace('words', '').replace('-', ',').split(',')
+            return int(parts[1].strip()) if len(parts) > 1 else int(parts[0].strip())
+        except (ValueError, IndexError):
+            return 3500
 
 
 class TenderClassifier:
     """Classifies tender documents by type, industry, and complexity."""
 
-    CLASSIFIER_PROMPT = """Analyze the following tender document and classify it.
+    CLASSIFIER_PROMPT = """You are an expert tender analyst. Analyze this tender document and classify it precisely.
 
 TENDER DOCUMENT:
 ---
 {tender_content}
 ---
 
-Return a JSON object with this structure (must be valid JSON):
-{{
-    "tender_type": "one of: cloud_services, fleet_management, tech_solutions, infrastructure, consulting, managed_services, logistics, telecom_services",
-    "industry": "the primary industry: telecom, transport, logistics, gov, finance, healthcare, retail",
-    "complexity": "simple|moderate|complex based on scope and requirements",
-    "key_themes": ["list of 3-5 main themes", "e.g., security, cost-efficiency, innovation"],
-    "evaluation_focus": ["list of 2-3 main evaluation criteria", "e.g., technical capability, price, compliance"],
-    "priority_areas": ["list of 2-4 areas buyer prioritizes", "e.g., reliability, support, scalability"],
-    "estimated_value": "estimated budget range or null if unknown"
-}}
+INSTRUCTIONS:
+1. Extract the primary service/product type being tendered
+2. Identify the industry or sector
+3. Assess scope and complexity
+4. List key themes mentioned (security, cost, innovation, etc.)
+5. Identify evaluation criteria from requirements
+6. Infer buyer priorities from the tender language
+7. Estimate project budget if mentioned
 
-Return ONLY valid JSON, no other text."""
+Return ONLY a valid JSON object (no markdown, no code blocks, no extra text):
+{{
+    "tender_type": "Select from: service_management, fleet_management, cloud_services, telecommunications, infrastructure, consulting, managed_services, logistics, supply_chain, healthcare, government",
+    "industry": "Select from: telecom, transport, logistics, government, finance, healthcare, retail, energy, manufacturing",
+    "complexity": "simple|moderate|complex",
+    "key_themes": ["theme1", "theme2", "theme3"],
+    "evaluation_focus": ["criterion1", "criterion2", "criterion3"],
+    "priority_areas": ["priority1", "priority2", "priority3"],
+    "estimated_value": "budget or \"not specified\""
+}}"""
+
+    # Keyword patterns for fallback classification
+    INDUSTRY_KEYWORDS = {
+        'telecom': ['telecommunications', 'mobile', 'network', 'signal', 'wireless', 'safaricom', 'vodafone'],
+        'transport': ['fleet', 'vehicles', 'logistics', 'transportation', 'vehicle', 'drivers', 'tracking'],
+        'logistics': ['logistics', 'supply chain', 'warehousing', 'distribution', 'shipping'],
+        'government': ['government', 'public', 'ministry', 'agency', 'state'],
+        'healthcare': ['healthcare', 'medical', 'hospital', 'health', 'clinic'],
+        'finance': ['finance', 'banking', 'financial', 'insurance'],
+        'energy': ['energy', 'power', 'electricity', 'solar', 'fuel']
+    }
+    
+    TYPE_KEYWORDS = {
+        'fleet_management': ['fleet', 'vehicles', 'tracking', 'driver'],
+        'cloud_services': ['cloud', 'aws', 'azure', 'hosting', 'server'],
+        'telecommunications': ['telecom', 'mobile', 'network', 'connectivity'],
+        'managed_services': ['managed', 'managed service', 'msp'],
+        'consulting': ['consulting', 'advisory', 'expertise', 'specialist'],
+        'infrastructure': ['infrastructure', 'build', 'construction', 'deploy']
+    }
 
     @staticmethod
-    def classify(tender_doc: TenderDocument) -> TenderProfile:
+    def classify(tender_doc: TenderDocument, progress_callback: Optional[callable] = None) -> TenderProfile:
         """
-        Classify a tender document.
+        Classify a tender document with LLM and fallback to pattern matching.
         
         Args:
             tender_doc: TenderDocument to classify
+            progress_callback: Optional callback function(step, total, step_name)
             
         Returns:
             TenderProfile: Classification results
@@ -100,16 +186,26 @@ Return ONLY valid JSON, no other text."""
             
             prompt = TenderClassifier.CLASSIFIER_PROMPT.format(tender_content=content)
             
-            logger.info("Classifying tender document...")
+            logger.info("Classifying tender document with LLM...")
+            if progress_callback:
+                progress_callback(1, 3, "classifying_tender")
+            
             response = model_manager.generate(
                 prompt=prompt,
-                temperature=0.3,
+                temperature=0.2,
                 max_tokens=500,
-                system_prompt="You are a tender classification expert. Output only valid JSON."
+                system_prompt="You are a tender classification expert. Return ONLY valid JSON, no other text."
             )
+            
+            logger.debug(f"LLM Response: {response[:200]}...")
             
             # Parse JSON response
             data = TenderClassifier._parse_json_response(response)
+            
+            # If parsing failed or returned empty, use pattern-based fallback
+            if not data or data.get('tender_type') == 'unknown':
+                logger.warning("LLM classification returned unknown, using pattern-based fallback...")
+                data = TenderClassifier._fallback_classification(tender_doc.raw_content, data or {})
             
             profile = TenderProfile(
                 tender_type=data.get('tender_type', 'unknown'),
@@ -121,39 +217,125 @@ Return ONLY valid JSON, no other text."""
                 estimated_value=data.get('estimated_value')
             )
             
-            logger.info(f"Tender classified: {profile.tender_type} ({profile.industry})")
+            logger.info(f"Tender classified: {profile.tender_type} ({profile.industry}) - Complexity: {profile.complexity}")
             return profile
         
         except Exception as e:
-            logger.error(f"Tender classification failed: {str(e)}")
-            # Return default profile
-            return TenderProfile(
-                tender_type="unknown",
-                industry="unknown",
-                complexity="moderate",
-                key_themes=[],
-                evaluation_focus=[],
-                priority_areas=[]
-            )
+            logger.error(f"Tender classification failed: {str(e)}", exc_info=True)
+            # Return default profile with fallback pattern matching
+            logger.info("Using pattern-based fallback classification...")
+            try:
+                return TenderClassifier._create_default_profile(tender_doc.raw_content)
+            except:
+                return TenderProfile(
+                    tender_type="unknown",
+                    industry="unknown",
+                    complexity="moderate",
+                    key_themes=[],
+                    evaluation_focus=[],
+                    priority_areas=[]
+                )
 
     @staticmethod
     def _parse_json_response(response: str) -> Dict[str, Any]:
-        """Parse JSON from LLM response."""
-        if "```json" in response:
-            start = response.find("```json") + 7
-            end = response.find("```", start)
-            response = response[start:end]
-        elif "```" in response:
-            start = response.find("```") + 3
-            end = response.find("```", start)
-            response = response[start:end]
+        """Parse JSON from LLM response with enhanced error handling."""
+        try:
+            # Remove markdown code blocks
+            if "```json" in response:
+                start = response.find("```json") + 7
+                end = response.find("```", start)
+                if end > start:
+                    response = response[start:end].strip()
+            elif "```" in response:
+                start = response.find("```") + 3
+                end = response.find("```", start)
+                if end > start:
+                    response = response[start:end].strip()
+            
+            # Find JSON object boundaries
+            start = response.find('{')
+            end = response.rfind('}') + 1
+            
+            if start >= 0 and end > start:
+                response = response[start:end].strip()
+                logger.debug(f"Extracted JSON: {response[:100]}...")
+                return json.loads(response)
+            else:
+                logger.warning("No JSON object found in response")
+                return {}
         
-        start = response.find('{')
-        end = response.rfind('}') + 1
-        if start >= 0 and end > start:
-            response = response[start:end]
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing failed: {str(e)}")
+            logger.debug(f"Response text: {response}")
+            return {}
+        except Exception as e:
+            logger.error(f"Error parsing response: {str(e)}")
+            return {}
+
+    @staticmethod
+    def _fallback_classification(content: str, partial_data: Dict) -> Dict[str, Any]:
+        """Fallback pattern-based classification using keywords."""
+        content_lower = content.lower()
         
-        return json.loads(response.strip())
+        # Detect industry
+        industry = 'unknown'
+        for ind, keywords in TenderClassifier.INDUSTRY_KEYWORDS.items():
+            if any(kw in content_lower for kw in keywords):
+                industry = ind
+                break
+        
+        # Detect tender type
+        tender_type = 'unknown'
+        for ttype, keywords in TenderClassifier.TYPE_KEYWORDS.items():
+            if any(kw in content_lower for kw in keywords):
+                tender_type = ttype
+                break
+        
+        # Detect complexity
+        complexity_dict = {'simple': 0, 'moderate': 1, 'complex': 2}
+        complexity = 'moderate'
+        for level, keywords in {'complex': ['complex', 'advanced', 'sophisticated'], 'simple': ['basic', 'simple', 'straightforward']}.items():
+            if any(kw in content_lower for kw in keywords):
+                complexity = level
+        
+        # Extract themes from content
+        themes = []
+        theme_keywords = {
+            'security': ['security', 'secure', 'protection', 'encrypted'],
+            'cost_efficiency': ['cost', 'budget', 'economical', 'savings'],
+            'scalability': ['scalable', 'scale', 'growth', 'expand'],
+            'reliability': ['reliable', 'uptime', 'availability', 'redundant'],
+            'support': ['support', 'maintenance', 'service', 'helpdesk'],
+            'innovation': ['innovative', 'cutting-edge', 'modern', 'latest']
+        }
+        
+        for theme, keywords in theme_keywords.items():
+            if any(kw in content_lower for kw in keywords):
+                themes.append(theme)
+        
+        return {
+            'tender_type': partial_data.get('tender_type', tender_type),
+            'industry': partial_data.get('industry', industry),
+            'complexity': partial_data.get('complexity', complexity),
+            'key_themes': partial_data.get('key_themes', themes[:5]),
+            'evaluation_focus': partial_data.get('evaluation_focus', ['Technical capability', 'Cost', 'Experience']),
+            'priority_areas': partial_data.get('priority_areas', ['Reliability', 'Support', 'Quality']),
+            'estimated_value': partial_data.get('estimated_value', 'Not specified')
+        }
+
+    @staticmethod
+    def _create_default_profile(content: str) -> TenderProfile:
+        """Create a profile using pattern-based classification."""
+        data = TenderClassifier._fallback_classification(content, {})
+        
+        return TenderProfile(
+            tender_type=data.get('tender_type', 'unknown'),
+            industry=data.get('industry', 'unknown'),
+            complexity=data.get('complexity', 'moderate'),
+            key_themes=data.get('key_themes', ['Cost', 'Reliability', 'Support']),
+            evaluation_focus=data.get('evaluation_focus', ['Technical capability', 'Cost', 'Experience']),
+            priority_areas=data.get('priority_areas', ['Reliability', 'Support', 'Quality'])
+        )
 
 
 class DynamicProposalDesigner:
@@ -260,7 +442,8 @@ class DynamicProposalDesigner:
     def design_structure(
         self,
         tender_doc: TenderDocument,
-        tender_profile: Optional[TenderProfile] = None
+        tender_profile: Optional[TenderProfile] = None,
+        progress_callback: Optional[callable] = None
     ) -> DynamicProposalStructure:
         """
         Design proposal structure for a tender.
@@ -268,6 +451,7 @@ class DynamicProposalDesigner:
         Args:
             tender_doc: Tender document
             tender_profile: Optional pre-classified tender profile
+            progress_callback: Optional callback function(step, total, step_name)
             
         Returns:
             DynamicProposalStructure: Designed proposal structure
@@ -275,12 +459,18 @@ class DynamicProposalDesigner:
         try:
             # Classify tender if not provided
             if not tender_profile:
-                tender_profile = TenderClassifier.classify(tender_doc)
+                if progress_callback:
+                    progress_callback(1, 4, "classifying_tender")
+                tender_profile = TenderClassifier.classify(tender_doc, progress_callback)
             
             # Find similar past proposals in RAG
+            if progress_callback:
+                progress_callback(2, 4, "loading_references")
             similar_proposals = self._find_similar_proposals(tender_profile)
             
             # Identify needed custom sections
+            if progress_callback:
+                progress_callback(3, 4, "designing_structure")
             custom_sections = self._identify_custom_sections(tender_profile, tender_doc)
             
             # Determine section ordering and emphasis

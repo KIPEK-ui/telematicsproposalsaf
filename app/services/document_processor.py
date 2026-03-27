@@ -2,12 +2,16 @@
 Document Processor Service
 Converts PDF and DOCX files into text format for RAG training.
 Supports PDF extraction (pdfplumber) and DOCX extraction (python-docx).
+✅ ENHANCED: Adds extraction result caching to avoid re-processing
 """
 
 import logging
+import hashlib
+import json
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,7 @@ class DocumentProcessor:
     """
     Processes PDF and DOCX documents into text format for RAG training.
     Automatically detects file type and uses appropriate extraction method.
+    ✅ ENHANCED: Caches extraction results to avoid re-processing same files
     """
 
     def __init__(self, output_dir: Optional[Path] = None):
@@ -49,11 +54,79 @@ class DocumentProcessor:
             self.output_dir = Path("data/training_proposals")
         
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # ✅ NEW: Processing cache to track processed files
+        self.cache_dir = Path("data/.processing_cache")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_file = self.cache_dir / "extraction_cache.json"
+        self._extraction_cache: Dict[str, Dict[str, Any]] = {}
+        self._load_extraction_cache()
+        
         logger.info(f"DocumentProcessor initialized with output: {self.output_dir}")
+
+    def _get_file_hash(self, file_path: Path) -> str:
+        """Generate hash of file for cache validation."""
+        try:
+            with open(file_path, 'rb') as f:
+                return hashlib.md5(f.read()).hexdigest()
+        except Exception:
+            return ""
+
+    def _load_extraction_cache(self) -> None:
+        """Load extraction cache from disk."""
+        try:
+            if self.cache_file.exists():
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    self._extraction_cache = json.load(f)
+                logger.debug(f"Loaded extraction cache with {len(self._extraction_cache)} entries")
+        except Exception as e:
+            logger.warning(f"Failed to load extraction cache: {e}")
+            self._extraction_cache = {}
+
+    def _save_extraction_cache(self) -> None:
+        """Save extraction cache to disk."""
+        try:
+            with open(self.cache_file, 'w', encoding='utf-8') as f:
+                json.dump(self._extraction_cache, f, indent=2)
+            logger.debug("Saved extraction cache")
+        except Exception as e:
+            logger.warning(f"Failed to save extraction cache: {e}")
+
+    def _is_cached(self, file_path: Path) -> Optional[str]:
+        """Check if file was already processed and is still valid."""
+        try:
+            file_hash = self._get_file_hash(file_path)
+            cache_key = str(file_path.absolute())
+            
+            if cache_key in self._extraction_cache:
+                cached = self._extraction_cache[cache_key]
+                if cached.get('file_hash') == file_hash and cached.get('extraction_result'):
+                    logger.debug(f"Cache hit for {file_path.name}")
+                    return cached['extraction_result']
+        except Exception as e:
+            logger.debug(f"Cache check failed: {e}")
+        
+        return None
+
+    def _cache_result(self, file_path: Path, extracted_text: str) -> None:
+        """Cache extraction result for future use."""
+        try:
+            file_hash = self._get_file_hash(file_path)
+            cache_key = str(file_path.absolute())
+            
+            self._extraction_cache[cache_key] = {
+                'file_hash': file_hash,
+                'extraction_result': extracted_text,
+                'cached_at': datetime.now().isoformat()
+            }
+            self._save_extraction_cache()
+        except Exception as e:
+            logger.warning(f"Failed to cache extraction result: {e}")
 
     def process_file(self, file_path: str) -> ProcessedDocument:
         """
         Process a single document (PDF, DOCX, or TXT).
+        ✅ ENHANCED: Checks cache first to avoid re-extraction
         
         Args:
             file_path: Path to the document file
@@ -74,6 +147,34 @@ class DocumentProcessor:
             )
         
         try:
+            # ✅ NEW: Check cache first
+            cached_text = self._is_cached(file_path)
+            if cached_text is not None:
+                logger.info(f"Using cached extraction for {file_path.name}")
+                
+                # Still need to determine doc type and output path
+                suffix = file_path.suffix.lower()
+                if suffix == '.pdf':
+                    doc_type = 'pdf'
+                elif suffix in ['.docx', '.doc']:
+                    doc_type = 'docx'
+                elif suffix == '.txt':
+                    doc_type = 'txt'
+                else:
+                    doc_type = 'unknown'
+                
+                # Save to output if not already there
+                output_file = self._save_text(file_path, cached_text, doc_type)
+                
+                return ProcessedDocument(
+                    original_path=str(file_path),
+                    output_path=str(output_file),
+                    document_type=doc_type,
+                    extracted_text=cached_text,
+                    success=True
+                )
+            
+            # Cache miss - process normally
             # Detect document type
             suffix = file_path.suffix.lower()
             
@@ -88,6 +189,9 @@ class DocumentProcessor:
                 doc_type = 'txt'
             else:
                 raise DocumentProcessorError(f"Unsupported file type: {suffix}")
+            
+            # ✅ NEW: Cache the extraction result
+            self._cache_result(file_path, text)
             
             # Save to text file
             output_file = self._save_text(file_path, text, doc_type)

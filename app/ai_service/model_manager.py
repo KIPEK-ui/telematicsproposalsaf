@@ -7,6 +7,7 @@ Supports Ollama for easy deployment and model switching.
 import os
 import logging
 import json
+import hashlib
 from typing import Optional, Dict, Any, List
 from enum import Enum
 from dataclasses import dataclass
@@ -121,7 +122,8 @@ class LocalLMManager:
     def __init__(
         self,
         ollama_base_url: str = "http://localhost:11434",
-        default_model: str = "llama3.1:8b"
+        default_model: str = "llama3.1:8b",
+        cache_size: int = 100
     ):
         """
         Initialize model manager.
@@ -129,6 +131,7 @@ class LocalLMManager:
         Args:
             ollama_base_url: Base URL for Ollama API
             default_model: Default model to load (llama3.1:8b recommended)
+            cache_size: Maximum number of inference results to cache (default: 100)
         """
         self.ollama_base_url = ollama_base_url
         self.default_model_id = default_model
@@ -137,9 +140,83 @@ class LocalLMManager:
             status=ModelStatus.UNINITIALIZED,
             last_check=datetime.now().isoformat()
         )
-        self._inference_cache: Dict[str, str] = {}
+        # ✅ NEW: Inference result caching with LRU eviction
+        self._inference_cache: Dict[str, str] = {}  # cache_key -> response
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_max_size = cache_size
+        self._model_availability_cache: Dict[str, tuple] = {}  # model_id -> (available, timestamp)
+        self._model_availability_ttl_seconds = 600  # 10 minute TTL for model list
         
         logger.info(f"LocalLMManager initialized with Ollama at {ollama_base_url}")
+        logger.info(f"Inference cache enabled (max size: {cache_size})")
+
+    # ========================
+    # Cache Management Methods
+    # ========================
+
+    def _generate_cache_key(self, prompt: str, temperature: float, top_p: float) -> str:
+        """
+        Generate deterministic cache key from inference parameters.
+        
+        Args:
+            prompt: Input prompt
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            
+        Returns:
+            str: MD5 hash of parameters
+        """
+        cache_str = f"{prompt}|{temperature}|{top_p}|{self.current_model.model_id if self.current_model else 'default'}".encode()
+        return hashlib.md5(cache_str).hexdigest()
+
+    def _get_cache_entry(self, cache_key: str) -> Optional[str]:
+        """Get entry from cache if available."""
+        if cache_key in self._inference_cache:
+            self._cache_hits += 1
+            logger.debug(f"Cache hit ({self._cache_hits} total hits)")
+            return self._inference_cache[cache_key]
+        self._cache_misses += 1
+        return None
+
+    def _set_cache_entry(self, cache_key: str, value: str) -> None:
+        """Store entry in cache with LRU eviction."""
+        if len(self._inference_cache) >= self._cache_max_size:
+            # Remove oldest entry (first inserted)
+            oldest_key = next(iter(self._inference_cache))
+            del self._inference_cache[oldest_key]
+            logger.debug(f"Cache evicted ({len(self._inference_cache)} remaining)")
+        
+        self._inference_cache[cache_key] = value
+        logger.debug(f"Cached inference result ({len(self._inference_cache)} total cached)")
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache performance statistics."""
+        total_requests = self._cache_hits + self._cache_misses
+        hit_rate = (self._cache_hits / total_requests * 100) if total_requests > 0 else 0
+        return {
+            'cache_size': len(self._inference_cache),
+            'cache_max_size': self._cache_max_size,
+            'cache_hits': self._cache_hits,
+            'cache_misses': self._cache_misses,
+            'hit_rate_percent': round(hit_rate, 2),
+            'total_requests': total_requests
+        }
+
+    def clear_cache(self) -> int:
+        """
+        Clear all cached inferences.
+        
+        Returns:
+            int: Number of entries cleared
+        """
+        count = len(self._inference_cache)
+        self._inference_cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        logger.info(f"Cleared {count} cache entries")
+        return count
+        logger.info(f"Inference cache enabled (max size: {cache_size})")
 
     # ========================
     # Model Health & Status
@@ -210,7 +287,7 @@ class LocalLMManager:
 
     def is_model_available(self, model_id: str) -> bool:
         """
-        Check if a specific model is available.
+        Check if a specific model is available (with TTL caching).
         
         Args:
             model_id: Model identifier
@@ -218,9 +295,24 @@ class LocalLMManager:
         Returns:
             bool: True if model is available
         """
+        # ✅ NEW: Check cache first with TTL
+        if model_id in self._model_availability_cache:
+            available, timestamp = self._model_availability_cache[model_id]
+            if (datetime.now() - timestamp).total_seconds() < self._model_availability_ttl_seconds:
+                logger.debug(f"Model availability cached: {model_id}")
+                return available
+            else:
+                # TTL expired, remove from cache
+                del self._model_availability_cache[model_id]
+        
+        # Cache miss or expired - check actual availability
         try:
             available_models = self.list_available_models()
-            return model_id in available_models
+            is_available = model_id in available_models
+            
+            # Store in cache with current timestamp
+            self._model_availability_cache[model_id] = (is_available, datetime.now())
+            return is_available
         except ModelConnectionError:
             return False
 
@@ -290,7 +382,8 @@ class LocalLMManager:
         top_p: Optional[float] = None,
         system_prompt: Optional[str] = None,
         stream: bool = False,
-        timeout: int = 120
+        timeout: int = 600,
+        use_cache: bool = True
     ) -> str:
         """
         Generate text using the current model.
@@ -302,7 +395,8 @@ class LocalLMManager:
             top_p: Nucleus sampling parameter (uses model default if None)
             system_prompt: System/instruction prompt for role-based behavior
             stream: Whether to stream response (returns after full response currently)
-            timeout: Request timeout in seconds (default: 120)
+            timeout: Request timeout in seconds (default: 600 = 10 min. Use 900-1200 for complex proposals)
+            use_cache: Whether to use cached results (default: True)
         
         Returns:
             str: Generated text
@@ -324,8 +418,19 @@ class LocalLMManager:
         if system_prompt:
             full_prompt = f"{system_prompt}\n\n{prompt}"
         
+        # ✅ NEW: Check cache before inference
+        cache_key = self._generate_cache_key(full_prompt, temperature, top_p) if use_cache else None
+        if cache_key:
+            cached_result = self._get_cache_entry(cache_key)
+            if cached_result is not None:
+                logger.info(f"Returning cached inference (cache key: {cache_key[:8]}...)")
+                return cached_result
+        
         try:
-            # Call Ollama API
+            # Call Ollama API with generous timeout for proposal generation
+            # Models can be slow, especially for complex proposals
+            adjusted_timeout = max(timeout, 600) if timeout else 1200
+            
             response = requests.post(
                 f"{self.ollama_base_url}/api/generate",
                 json={
@@ -339,7 +444,7 @@ class LocalLMManager:
                         **self.current_model.parameters
                     }
                 },
-                timeout=timeout
+                timeout=adjusted_timeout
             )
             response.raise_for_status()
             
@@ -351,6 +456,11 @@ class LocalLMManager:
             self.metrics.tokens_processed += result.get('eval_count', 0)
             
             logger.info(f"Generation successful. Tokens: {result.get('eval_count', 0)}")
+            
+            # ✅ NEW: Cache the result
+            if cache_key:
+                self._set_cache_entry(cache_key, generated_text.strip())
+            
             return generated_text.strip()
         
         except requests.exceptions.Timeout:
@@ -412,7 +522,7 @@ class LocalLMManager:
         Get model performance and status metrics.
         
         Returns:
-            Dict: Metrics including status, inference count, tokens processed
+            Dict: Metrics including status, inference count, tokens processed, and cache stats
         """
         return {
             'status': self.metrics.status.value,
@@ -421,7 +531,8 @@ class LocalLMManager:
             'error_message': self.metrics.error_message,
             'tokens_processed': self.metrics.tokens_processed,
             'inference_count': self.metrics.inference_count,
-            'current_model': self.current_model.model_id if self.current_model else None
+            'current_model': self.current_model.model_id if self.current_model else None,
+            'cache_stats': self.get_cache_stats()  # ✅ NEW: Include cache performance
         }
 
     def get_setup_instructions(self) -> str:
